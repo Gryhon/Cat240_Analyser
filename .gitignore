@@ -1,0 +1,14 @@
+# Folder
+__pycache__/
+venv_*/
+.claude/
+memory/
+Data/
+Information/
+
+# MacOS
+._*
+.DS_Store
+
+# Project
+CLAUDE.md
