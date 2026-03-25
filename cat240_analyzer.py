@@ -20,6 +20,9 @@ Usage:
     # Play back 20× faster:
     python cat240_analyzer.py --replay aufzeichnung.pcapng --speed 20
 
+    # Loop replay continuously (PPI cleared on each restart):
+    python cat240_analyzer.py --replay aufzeichnung.pcapng --loop --speed 10
+
     # Live stream from UDP port:
     python cat240_analyzer.py --live --port 5000
 
@@ -313,6 +316,8 @@ class PcapReader:
         self.filepath = filepath
         self._format = None    # 'pcap' or 'pcapng'
         self._endian = '<'
+        # IP-Fragment-Puffer: {(src_ip, dst_ip, proto, ip_id): {'frags': {offset: bytes}, 'last': bool}}
+        self._frag_buffer: dict = {}
 
     def packets(self):
         """Generator: yields (timestamp, udp_payload_bytes) for each UDP packet."""
@@ -329,8 +334,9 @@ class PcapReader:
 
     def _read_pcap(self, f, magic):
         endian = '<' if magic == self.PCAP_MAGIC_LE else '>'
-        header = f.read(20)  # remaining 20 bytes of the Global Header
-        link_type = struct.unpack(endian + 'I', header[16:20])[0] if len(header) >= 20 else 1
+        # packets() seeks back to 0 before calling us, so we read the full 24-byte global header
+        header = f.read(24)
+        link_type = struct.unpack(endian + 'I', header[20:24])[0] if len(header) >= 24 else 1
 
         while True:
             rec_hdr = f.read(16)
@@ -379,7 +385,8 @@ class PcapReader:
                         yield timestamp, result[0], result[1], result[2]
 
     def _extract_udp(self, raw: bytes, link_type: int) -> Optional[Tuple[bytes, str, int]]:
-        """Extracts UDP payload + destination IP + destination port from an Ethernet/IP packet."""
+        """Extracts UDP payload + destination IP + destination port from an Ethernet/IP packet.
+        Supports IP fragment reassembly (e.g. SAT2 radar with 8 kB UDP datagrams)."""
         try:
             if link_type == 1:   # Ethernet
                 eth_hdr = raw[:14]
@@ -400,18 +407,57 @@ class PcapReader:
             ip_hdr = raw[ip_start:]
             if len(ip_hdr) < 20:
                 return None
-            ihl = (ip_hdr[0] & 0x0F) * 4
-            protocol = ip_hdr[9]
+            ihl       = (ip_hdr[0] & 0x0F) * 4
+            protocol  = ip_hdr[9]
             if protocol != 17:  # UDP only
                 return None
-            dst_ip = '.'.join(str(b) for b in ip_hdr[16:20])
-            udp_start = ip_start + ihl
-            udp_hdr = raw[udp_start:udp_start + 8]
-            if len(udp_hdr) < 8:
+            src_ip    = '.'.join(str(b) for b in ip_hdr[12:16])
+            dst_ip    = '.'.join(str(b) for b in ip_hdr[16:20])
+            ip_id     = struct.unpack('>H', ip_hdr[4:6])[0]
+            flags_frag = struct.unpack('>H', ip_hdr[6:8])[0]
+            mf        = bool((flags_frag >> 13) & 1)
+            frag_off  = (flags_frag & 0x1FFF) * 8
+
+            ip_payload = raw[ip_start + ihl:]
+
+            if not mf and frag_off == 0:
+                # Nicht fragmentiert – direkt decodieren
+                if len(ip_payload) < 8:
+                    return None
+                dst_port = struct.unpack('>H', ip_payload[2:4])[0]
+                udp_len  = struct.unpack('>H', ip_payload[4:6])[0]
+                return ip_payload[8:udp_len], dst_ip, dst_port
+
+            # ── IP-Fragmentierung ────────────────────────────────────────────
+            key = (src_ip, dst_ip, protocol, ip_id)
+            if key not in self._frag_buffer:
+                self._frag_buffer[key] = {'frags': {}, 'last_off': -1, 'dst_ip': dst_ip}
+            entry = self._frag_buffer[key]
+            entry['frags'][frag_off] = ip_payload
+            if not mf:
+                entry['last_off'] = frag_off
+
+            # Reassemblieren sobald letztes Fragment bekannt ist
+            if entry['last_off'] < 0:
+                return None   # letztes Fragment noch nicht eingetroffen
+
+            offsets = sorted(entry['frags'].keys())
+            # Vollständigkeitsprüfung: lückenlose Abdeckung bis last_off
+            total = bytearray()
+            for off in offsets:
+                if off != len(total):
+                    return None  # Lücke – noch nicht vollständig
+                total.extend(entry['frags'][off])
+
+            del self._frag_buffer[key]
+
+            # UDP-Header aus reassembliertem Datagramm lesen
+            if len(total) < 8:
                 return None
-            dst_port = struct.unpack('>H', udp_hdr[2:4])[0]
-            udp_len = struct.unpack('>H', udp_hdr[4:6])[0]
-            return raw[udp_start + 8: udp_start + udp_len], dst_ip, dst_port
+            dst_port = struct.unpack('>H', bytes(total[2:4]))[0]
+            udp_len  = struct.unpack('>H', bytes(total[4:6]))[0]
+            return bytes(total[8:udp_len]), dst_ip, dst_port
+
         except Exception:
             return None
 
@@ -447,6 +493,9 @@ class RadarPPI:
         self.cell_size_m      = 0.0
         self._cell_duration_ns = 0.0   # Referenzwert für Range-Wechsel-Erkennung
         self.range_resets      = 0     # Zählt automatische Grid-Resets
+        # Range-Ring-Patches (werden bei cell_size-Änderung neu gezeichnet)
+        self._range_ring_patches: list = []
+        self._rings_drawn_for_cell_size: float = -1.0
 
     def add_message(self, msg: Cat240Message):
         """Inserts a CAT240 azimuth into the PPI grid."""
@@ -498,16 +547,12 @@ class RadarPPI:
         if self._mesh is None or self._mesh_ax is not ax:
             # First draw: build axis, create pcolormesh
             ax.clear()
+            self._range_ring_patches = []
+            self._rings_drawn_for_cell_size = -1.0
             ax.set_facecolor('black')
             self._mesh = ax.pcolormesh(self._X, self._Y, grid_copy, cmap=colormap,
                                        norm=norm, shading='nearest', rasterized=True)
             self._mesh_ax = ax
-
-            # Range rings
-            for r_frac in [0.25, 0.5, 0.75, 1.0]:
-                circle = plt.Circle((0, 0), self.max_range_cells * r_frac,
-                                     color='#00ff41', fill=False, linewidth=0.5, alpha=0.4)
-                ax.add_patch(circle)
 
             # Azimuth lines (every 30°)
             for deg in range(0, 360, 30):
@@ -532,9 +577,46 @@ class RadarPPI:
             if norm is not None:
                 self._mesh.set_norm(norm)
 
+        # Range rings – neu zeichnen wenn cell_size_m sich geändert hat
+        if self.cell_size_m != self._rings_drawn_for_cell_size:
+            for p in self._range_ring_patches:
+                try:
+                    p.remove()
+                except Exception:
+                    pass
+            self._range_ring_patches = []
+            self._draw_range_rings(ax, plt)
+            self._rings_drawn_for_cell_size = self.cell_size_m
+
         reset_info = f'  |  {self.range_resets}× Range-Reset' if self.range_resets > 0 else ''
         ax.set_title(f'{title}  |  {msg_count} azimuths{reset_info}', color='white', fontsize=10)
         return self._mesh
+
+    def _draw_range_rings(self, ax, plt, interval_nm: float = 6.0):
+        """Zeichnet Range-Ringe alle interval_nm Seemeilen (oder Bruchteile wenn cell_size unbekannt)."""
+        NM = 1852.0
+        if self.cell_size_m > 0:
+            interval_cells = interval_nm * NM / self.cell_size_m
+            max_nm = self.max_range_cells * self.cell_size_m / NM
+            r_nm = interval_nm
+            while r_nm <= max_nm + 0.01:
+                r_cells = r_nm * NM / self.cell_size_m
+                circle = plt.Circle((0, 0), r_cells, color='#00ff41',
+                                    fill=False, linewidth=0.5, alpha=0.4)
+                ax.add_patch(circle)
+                txt = ax.text(0, r_cells, f'{r_nm:.0f} nm',
+                              color='#00ff41', fontsize=6, ha='center', va='bottom',
+                              alpha=0.6)
+                self._range_ring_patches.extend([circle, txt])
+                r_nm += interval_nm
+        else:
+            # Fallback ohne cell_size: Bruchteile
+            for r_frac in [0.25, 0.5, 0.75, 1.0]:
+                r_cells = self.max_range_cells * r_frac
+                circle = plt.Circle((0, 0), r_cells, color='#00ff41',
+                                    fill=False, linewidth=0.5, alpha=0.4)
+                ax.add_patch(circle)
+                self._range_ring_patches.append(circle)
 
     def clear(self):
         with self._lock:
@@ -574,7 +656,10 @@ class AScope:
     CURSOR = '#ffcc00'
     WM     = '#ff44ff'   # width measurement colour
 
-    def __init__(self, ppi: 'RadarPPI', initial_azimuth: float = 0.0):
+    LC_COLOR = '#ffaa00'   # Farbe der Log-Compression-Kurve
+
+    def __init__(self, ppi: 'RadarPPI', initial_azimuth: float = 0.0,
+                 log_compress: bool = False):
         import matplotlib.pyplot as plt
         import matplotlib.gridspec as gridspec
 
@@ -585,9 +670,11 @@ class AScope:
         self._cursor_x: Optional[float] = None
         self._mode_change_cb   = None    # fn(mode)     – PPI overlay mode change
         self._cursor_change_cb = None    # fn(x | None) – PPI overlay cursor position
+        self._log_compress     = log_compress
+        self._p0: float        = 1.0
+        self._p0_cache_count: int = -1  # _msg_count bei letzter P0-Schätzung
 
-        self.fig = plt.figure(figsize=(12, 4), facecolor=self.BG,
-                              num='A-Scope  |  CAT240')
+        self.fig = plt.figure(figsize=(12, 4), facecolor=self.BG)
         self.fig.canvas.manager.set_window_title('A-Scope  |  CAT240')
 
         gs = gridspec.GridSpec(1, 1, figure=self.fig,
@@ -636,6 +723,23 @@ class AScope:
             bbox=dict(boxstyle='round,pad=0.4', facecolor='#1a001a',
                       edgecolor=self.WM, linewidth=1.2, alpha=0.0))
 
+        # Zweite Y-Achse für Log-Kompression (nur wenn aktiviert)
+        self.ax2       = None
+        self._line_lc  = None
+        self._fill_lc  = None
+        if log_compress:
+            self.ax2 = self.ax.twinx()
+            self.ax2.set_facecolor(self.BG)
+            self.ax2.tick_params(colors=self.LC_COLOR, labelsize=7)
+            for spine in self.ax2.spines.values():
+                spine.set_edgecolor(self.LC_COLOR)
+            self.ax2.set_ylabel('Log-compressed (0–1)', fontsize=8,
+                                color=self.LC_COLOR)
+            self.ax2.set_ylim(0, 1.1)
+            self._line_lc, = self.ax2.plot([], [], color=self.LC_COLOR,
+                                           linewidth=1.0, alpha=0.85,
+                                           linestyle='--', label='log-compressed')
+
         self._mode_confirmed = True   # False until user clicks in PPI after a mode change
         self._zoom_xlim: Optional[tuple] = None   # (lo, hi) wenn gezoomt, sonst None
         self._pan_press_px:   Optional[float] = None   # Maus-X in Pixel beim Drücken
@@ -661,8 +765,31 @@ class AScope:
         ax.xaxis.label.set_color(self.GREEN)
         ax.yaxis.label.set_color(self.GREEN)
         ax.set_ylabel('Amplitude', fontsize=8, color=self.GREEN)
+        ax.set_ylim(0, 255.0)   # Fixe linke Y-Achse: immer 0–255
         ax.grid(True, color=self.GRID, linewidth=0.5, linestyle=':')
         self._update_xlabel()
+
+    # ── Log-Kompression ───────────────────────────────────────────────────────
+
+    def _estimate_p0(self) -> float:
+        """Schätzt P₀ aus dem aktuellen Grid (10. Perzentile aller Nicht-Null-Werte).
+        Ergebnis wird gecacht bis sich _msg_count ändert."""
+        count = self.ppi._msg_count
+        if count == self._p0_cache_count:
+            return self._p0
+        with self.ppi._lock:
+            flat = self.ppi.grid[self.ppi.grid > 0]
+        if flat.size < 10:
+            return self._p0
+        self._p0 = float(np.percentile(flat, 10))
+        self._p0_cache_count = count
+        return self._p0
+
+    def _compress(self, data: np.ndarray) -> np.ndarray:
+        """Soft-Log-Kompression: clip(0,255, 20 + 240·log₁₀(1 + P/P₀))"""
+        with np.errstate(divide='ignore', invalid='ignore'):
+            out = 20.0 + 240.0 * np.log10(1.0 + data / self._p0)
+        return np.clip(out, 0.0, 255.0)
 
     def _update_xlabel(self):
         if self.mode == 'range':
@@ -682,8 +809,9 @@ class AScope:
                 detail = f'Range Cell {rc}'
         mode_lbl = 'Amp vs. Range' if self.mode == 'range' else 'Amp vs. Angle'
         zoom_hint = '  |  Scroll: zoom  |  Dbl-click: reset' if self._zoom_xlim is not None else '  |  Scroll: zoom'
+        lc_hint   = f'  |  LC P₀≈{self._p0:.0f}' if self._log_compress else ''
         self.fig.suptitle(
-            f'A-Scope  [{mode_lbl}]  |  {detail}  |  L-click: FWHM  |  R-click: span selection{zoom_hint}',
+            f'A-Scope  [{mode_lbl}]  |  {detail}  |  L-click: FWHM  |  R-click: span selection{zoom_hint}{lc_hint}',
             color=self.GREEN, fontsize=9, y=0.97)
 
     # ── Render ────────────────────────────────────────────────────────────────
@@ -697,6 +825,8 @@ class AScope:
     def _render_range(self):
         if not self._mode_confirmed:
             self._line.set_data([], [])
+            if self._line_lc is not None:
+                self._line_lc.set_data([], [])
             self._update_title()
             self.fig.canvas.draw_idle()
             return
@@ -711,7 +841,15 @@ class AScope:
         self._fill = self.ax.fill_between(x, 0, cells, color=self.GREEN, alpha=0.18)
         vmax = cells.max() if cells.max() > 0 else 1.0
         self.ax.set_xlim(0, n)
-        self.ax.set_ylim(0, vmax * 1.12)
+        self.ax.set_ylim(0, 255.0)
+        if self._log_compress:
+            self._estimate_p0()
+            lc = self._compress(cells) / 255.0
+            self._line_lc.set_data(x, lc)
+            if self._fill_lc is not None:
+                self._fill_lc.remove()
+            self._fill_lc = self.ax2.fill_between(x, 0, lc,
+                                                   color=self.LC_COLOR, alpha=0.10)
         if self._zoom_xlim is not None:
             self._apply_zoom(cells, np.arange(n, dtype=float))
         self._update_title()
@@ -736,7 +874,15 @@ class AScope:
         self._fill = self.ax.fill_between(x, 0, ring, color=self.GREEN, alpha=0.18)
         vmax = ring.max() if ring.max() > 0 else 1.0
         self.ax.set_xlim(0, 360)
-        self.ax.set_ylim(0, vmax * 1.12)
+        self.ax.set_ylim(0, 255.0)
+        if self._log_compress:
+            self._estimate_p0()
+            lc = self._compress(ring) / 255.0
+            self._line_lc.set_data(x, lc)
+            if self._fill_lc is not None:
+                self._fill_lc.remove()
+            self._fill_lc = self.ax2.fill_between(x, 0, lc,
+                                                   color=self.LC_COLOR, alpha=0.10)
         x_arr = np.linspace(0.0, 360.0, n, endpoint=False)
         if self._zoom_xlim is not None:
             self._apply_zoom(ring, x_arr)
@@ -748,11 +894,61 @@ class AScope:
             self._update_az_selection()
         self.fig.canvas.draw_idle()
 
+    def clear(self):
+        """Setzt den A-Scope-Inhalt zurück (leere Anzeige bis zum nächsten PPI-Klick)."""
+        self._line.set_data([], [])
+        if self._fill is not None:
+            try:
+                self._fill.remove()
+            except Exception:
+                pass
+            self._fill = None
+        if self._line_lc is not None:
+            self._line_lc.set_data([], [])
+        if self._fill_lc is not None:
+            try:
+                self._fill_lc.remove()
+            except Exception:
+                pass
+            self._fill_lc = None
+        self._vline.set_visible(False)
+        self._info_text.set_text('')
+        self._az_sel_vline_s.set_visible(False)
+        self._az_sel_vline_e.set_visible(False)
+        self._az_sel_text.set_text('')
+        if self._az_sel_fill is not None:
+            try:
+                self._az_sel_fill.remove()
+            except Exception:
+                pass
+            self._az_sel_fill = None
+        self._az_sel_start = None
+        self._az_sel_end   = None
+        self._wm_text.set_text('')
+        if self._wm_fill is not None:
+            try:
+                self._wm_fill.remove()
+            except Exception:
+                pass
+            self._wm_fill = None
+        self._zoom_xlim      = None
+        self._cursor_x       = None
+        self._mode_confirmed = False
+        self._update_title()
+        self.fig.canvas.draw_idle()
+
+    # ── Hilfsmethode: Event-Achsen-Prüfung ───────────────────────────────────
+
+    def _in_axes(self, event) -> bool:
+        """True wenn der Event auf ax oder ax2 (twinx) liegt."""
+        return event.inaxes is self.ax or (
+            self.ax2 is not None and event.inaxes is self.ax2)
+
     # ── Zoom ──────────────────────────────────────────────────────────────────
 
     def _on_scroll(self, event):
         """Scrollrad-Zoom auf der X-Achse, zentriert auf Cursor-Position."""
-        if event.inaxes != self.ax or event.xdata is None:
+        if not self._in_axes(event) or event.xdata is None:
             return
         factor = 0.6 if event.step > 0 else 1.0 / 0.6
         xlo, xhi = self.ax.get_xlim()
@@ -787,7 +983,7 @@ class AScope:
             mask = (x_arr >= lo) & (x_arr <= hi)
             if mask.any():
                 vmax = float(data[mask].max()) if data[mask].max() > 0 else 1.0
-                self.ax.set_ylim(0, vmax * 1.15)
+                self.ax.set_ylim(0, min(vmax * 1.15, 255.0))
 
     # ── Interaction ───────────────────────────────────────────────────────────
 
@@ -816,7 +1012,7 @@ class AScope:
                     self.fig.canvas.draw_idle()
                 return   # Cursor-Overlay während Pan unterdrücken
 
-        if event.inaxes != self.ax or event.xdata is None:
+        if not self._in_axes(event) or event.xdata is None:
             return
         self._cursor_x = event.xdata
         if self.mode == 'range':
@@ -844,7 +1040,7 @@ class AScope:
         Right-drag       : Pan (Ansicht verschieben).
         Right-click (no drag, azimuth mode) : manual span selection.
         """
-        if event.inaxes != self.ax or event.xdata is None:
+        if not self._in_axes(event) or event.xdata is None:
             return
 
         if event.dblclick and event.button == 1:
@@ -883,7 +1079,7 @@ class AScope:
             return   # War ein Drag → keine Span-Selection
 
         # Kein Drag → Span-Selection (azimuth mode only)
-        if event.inaxes != self.ax or event.xdata is None:
+        if not self._in_axes(event) or event.xdata is None:
             return
         if self.mode != 'azimuth':
             return
@@ -1086,10 +1282,13 @@ class AScope:
             vmax = data.max() if data.max() > 0 else 1.0
             self._vline.set_xdata([x, x])
             self._vline.set_visible(True)
+            lc_line = (f'\nLC    : {float(self._compress(np.array([amp]))[0]) / 255.0:.3f}'
+                       if self._log_compress else '')
             self._info_text.set_text(
                 f'{label}\n'
                 f'Amp   : {amp:.1f}\n'
                 f'Rel   : {amp / vmax * 100.0:.1f}%'
+                f'{lc_line}'
             )
         else:
             self._vline.set_visible(False)
@@ -1266,6 +1465,367 @@ def _prompt_live_config(default_host: str = '0.0.0.0',
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# PPI Toolbar-Buttons
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ascope_hide(fig) -> None:
+    """
+    Versteckt das A-Scope-Fenster über ObjC orderOut: ohne plt.close().
+    Verhindert macOS-Crash (SIGSEGV in objc_release) bei Aufruf aus Callback.
+    Auf Nicht-macOS-Systemen: plt.close() als Fallback.
+    """
+    import sys
+    if sys.platform != 'darwin':
+        import matplotlib.pyplot as plt
+        try:
+            plt.close(fig)
+        except Exception:
+            pass
+        return
+    try:
+        import ctypes
+        _lib  = ctypes.CDLL('/usr/lib/libobjc.A.dylib')
+        _send = _lib.objc_msgSend
+        _cls  = _lib.objc_getClass
+        _sel  = _lib.sel_registerName
+        _sel.restype  = ctypes.c_void_p
+        _sel.argtypes = [ctypes.c_char_p]
+        _cls.restype  = ctypes.c_void_p
+        _cls.argtypes = [ctypes.c_char_p]
+
+        _send.restype  = ctypes.c_void_p
+        _send.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        app     = _send(_cls(b'NSApplication'), _sel(b'sharedApplication'))
+        windows = _send(app, _sel(b'windows'))
+
+        _send.restype  = ctypes.c_ulong
+        count = _send(windows, _sel(b'count'))
+
+        target = 'A-Scope  |  CAT240'
+        for i in range(int(count)):
+            _send.restype  = ctypes.c_void_p
+            _send.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong]
+            win = _send(windows, _sel(b'objectAtIndex:'), ctypes.c_ulong(i))
+
+            _send.restype  = ctypes.c_void_p
+            _send.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            title_obj  = _send(win, _sel(b'title'))
+            _send.restype  = ctypes.c_char_p
+            title_utf8 = _send(title_obj, _sel(b'UTF8String'))
+
+            if title_utf8 and title_utf8.decode('utf-8', 'replace') == target:
+                _send.restype  = ctypes.c_void_p
+                _send.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+                _send(win, _sel(b'orderOut:'), None)
+                return
+    except Exception:
+        pass  # Kein Crash; Fenster bleibt sichtbar – besser als Absturz
+
+
+def _ascope_show(fig) -> None:
+    """Zeigt ein via _ascope_hide verstecktes A-Scope-Fenster wieder an."""
+    try:
+        fig.canvas.manager.show()
+        fig.canvas.draw()
+    except Exception:
+        pass
+
+
+def _hide_ppi_toolbar_deferred(fig, win_title: str) -> None:
+    """Versteckt die matplotlib-Toolbar beim ersten Draw-Event (Fenster ist dann bereit)."""
+    fired = [False]
+    def _on_draw(_event):
+        if not fired[0]:
+            fired[0] = True
+            _hide_ppi_toolbar(win_title)
+    fig.canvas.mpl_connect('draw_event', _on_draw)
+
+
+def _hide_ppi_toolbar(win_title: str) -> None:
+    """
+    Versteckt die matplotlib-Navigationsleiste (NavigationToolbar2Mac) im PPI-Fenster
+    via ObjC setHidden:. Das Toolbar-Objekt bleibt erhalten – Zoom/Home funktionieren
+    weiterhin über die eigenen Buttons.
+    """
+    import sys
+    if sys.platform != 'darwin':
+        return
+    try:
+        import ctypes
+        _lib  = ctypes.CDLL('/usr/lib/libobjc.A.dylib')
+        _send = _lib.objc_msgSend
+        _cls  = _lib.objc_getClass
+        _sel  = _lib.sel_registerName
+        _sel.restype  = ctypes.c_void_p
+        _sel.argtypes = [ctypes.c_char_p]
+        _cls.restype  = ctypes.c_void_p
+        _cls.argtypes = [ctypes.c_char_p]
+
+        _send.restype  = ctypes.c_void_p
+        _send.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        app     = _send(_cls(b'NSApplication'), _sel(b'sharedApplication'))
+        windows = _send(app, _sel(b'windows'))
+
+        _send.restype  = ctypes.c_ulong
+        count = _send(windows, _sel(b'count'))
+
+        for i in range(int(count)):
+            _send.restype  = ctypes.c_void_p
+            _send.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong]
+            win = _send(windows, _sel(b'objectAtIndex:'), ctypes.c_ulong(i))
+
+            _send.restype  = ctypes.c_void_p
+            _send.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            title_obj  = _send(win, _sel(b'title'))
+            _send.restype  = ctypes.c_char_p
+            title_utf8 = _send(title_obj, _sel(b'UTF8String'))
+
+            if not (title_utf8 and title_utf8.decode('utf-8', 'replace') == win_title):
+                continue
+
+            # contentView → subviews → NavigationToolbar2Mac → setHidden:
+            _send.restype  = ctypes.c_void_p
+            _send.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            content  = _send(win, _sel(b'contentView'))
+            subviews = _send(content, _sel(b'subviews'))
+
+            _send.restype  = ctypes.c_ulong
+            sv_count = _send(subviews, _sel(b'count'))
+
+            for j in range(int(sv_count)):
+                _send.restype  = ctypes.c_void_p
+                _send.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong]
+                sv = _send(subviews, _sel(b'objectAtIndex:'), ctypes.c_ulong(j))
+
+                _send.restype  = ctypes.c_void_p
+                _send.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+                cn_nsstr = _send(sv, _sel(b'className'))
+                _send.restype  = ctypes.c_char_p
+                cn = _send(cn_nsstr, _sel(b'UTF8String'))
+
+                if cn and b'Toolbar' in cn:
+                    _send.restype  = None
+                    _send.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool]
+                    _send(sv, _sel(b'setHidden:'), ctypes.c_bool(True))
+            return
+    except Exception:
+        pass
+
+
+def _setup_ppi_buttons(fig_ppi, ax_ppi, ppi, ascope_ref: list,
+                       toggle_ascope_fn,
+                       playback_state: dict,
+                       toggle_pause_fn=None):
+    """
+    Fügt Steuer-Buttons am unteren Rand des PPI-Fensters ein.
+
+    ax_ppi           : Axes-Objekt des PPI (für Home-Reset)
+    ascope_ref       : [AScope]  – mutable Referenz; wird durch toggle_ascope_fn ersetzt
+    playback_state   : {'paused': False}
+    toggle_pause_fn  : callable(paused: bool) oder None → Pause-Button wird ausgeblendet
+    """
+    from matplotlib.widgets import Button
+    from datetime import datetime
+
+    _BG  = '#111111'
+    _FG  = '#00ff41'
+    _HOV = '#1a2a1a'
+    _ACT = '#0a3a0a'
+
+    fig_ppi.subplots_adjust(left=0.01, right=0.99, top=0.97, bottom=0.065)
+
+    def _btn(rect, label):
+        ax_b = fig_ppi.add_axes(rect)
+        b = Button(ax_b, label, color=_BG, hovercolor=_HOV)
+        b.label.set_color(_FG)
+        b.label.set_fontsize(9)
+        b.label.set_fontfamily('monospace')
+        return b
+
+    btn_pause  = _btn([0.01, 0.01, 0.08, 0.045], 'Pause')
+    btn_zoom   = _btn([0.10, 0.01, 0.07, 0.045], 'Zoom')
+    btn_ascope = _btn([0.18, 0.01, 0.12, 0.045], '[ ] A-Scope')
+    btn_shot   = _btn([0.31, 0.01, 0.13, 0.045], 'Screenshot')
+
+    # ── Zoom-State ────────────────────────────────────────────────────────────
+    zoom_active = [False]
+    _zs   = [None]   # Startpunkt (x, y) in Daten-Koordinaten
+    _zlast = [None]  # zuletzt bekannte Daten-Koordinaten (auch ausserhalb der Axes)
+    _zr   = [None]   # aktives Rectangle-Patch
+
+    try:
+        from matplotlib.backend_bases import cursors as _cursors
+        _CUR_CROSS  = _cursors.SELECT_REGION
+        _CUR_NORMAL = _cursors.POINTER
+    except Exception:
+        _CUR_CROSS = _CUR_NORMAL = None
+
+    def _zoom_deactivate():
+        zoom_active[0] = False
+        _zs[0] = None
+        _zlast[0] = None
+        if _zr[0] is not None:
+            try: _zr[0].remove()
+            except Exception: pass
+            _zr[0] = None
+        btn_zoom.ax.set_facecolor(_BG)
+        if _CUR_NORMAL is not None:
+            try: fig_ppi.canvas.set_cursor(_CUR_NORMAL)
+            except Exception: pass
+
+    def _display_to_data(ex, ey):
+        """Konvertiert Display-Pixel nach Daten-Koordinaten (klappt auch ausserhalb ax_ppi)."""
+        try:
+            return ax_ppi.transData.inverted().transform((ex, ey))
+        except Exception:
+            return None, None
+
+    # ── Zoom (Rechteck-Zoom, toolbar-unabhängig) ──────────────────────────────
+    def _zoom_press(event):
+        if not zoom_active[0]: return
+        if event.button != 1: return
+        if getattr(event, 'dblclick', False): return
+        # Nur starten wenn Klick innerhalb ax_ppi
+        if event.inaxes is not ax_ppi: return
+        x, y = _display_to_data(event.x, event.y)
+        if x is None: return
+        _zs[0] = (x, y)
+        _zlast[0] = (x, y)
+
+    def _zoom_motion(event):
+        if not zoom_active[0] or _zs[0] is None: return
+        # Position immer via Display-Koordinaten → klappt auch ausserhalb ax_ppi
+        x, y = _display_to_data(event.x, event.y)
+        if x is None: return
+        _zlast[0] = (x, y)
+        from matplotlib.patches import Rectangle as _Rect
+        x0, y0 = _zs[0]
+        if _zr[0] is not None:
+            try: _zr[0].remove()
+            except Exception: pass
+        p = _Rect((min(x0, x), min(y0, y)), abs(x - x0), abs(y - y0),
+                  linewidth=1, edgecolor='white', facecolor=(1, 1, 1, 0.06),
+                  linestyle='--', zorder=10)
+        ax_ppi.add_patch(p)
+        _zr[0] = p
+        fig_ppi.canvas.draw_idle()
+
+    def _zoom_release(event):
+        if not zoom_active[0] or _zs[0] is None: return
+        if event.button != 1: return
+        if _zr[0] is not None:
+            try: _zr[0].remove()
+            except Exception: pass
+            _zr[0] = None
+        x0, y0 = _zs[0]
+        _zs[0] = None
+        # Endpunkt: aktuelle Position oder letzte bekannte
+        x1, y1 = _display_to_data(event.x, event.y)
+        if x1 is None and _zlast[0] is not None:
+            x1, y1 = _zlast[0]
+        _zlast[0] = None
+        if x1 is None or (abs(x1 - x0) < 1 and abs(y1 - y0) < 1):
+            fig_ppi.canvas.draw_idle()
+            return
+        ax_ppi.set_xlim(min(x0, x1), max(x0, x1))
+        ax_ppi.set_ylim(min(y0, y1), max(y0, y1))
+        _zoom_deactivate()
+        fig_ppi.canvas.draw_idle()
+
+    fig_ppi.canvas.mpl_connect('button_press_event',   _zoom_press)
+    fig_ppi.canvas.mpl_connect('motion_notify_event',  _zoom_motion)
+    fig_ppi.canvas.mpl_connect('button_release_event', _zoom_release)
+
+    def on_zoom(_):
+        if zoom_active[0]:
+            _zoom_deactivate()
+        else:
+            zoom_active[0] = True
+            btn_zoom.ax.set_facecolor(_ACT)
+            if _CUR_CROSS is not None:
+                try: fig_ppi.canvas.set_cursor(_CUR_CROSS)
+                except Exception: pass
+        fig_ppi.canvas.draw_idle()
+    btn_zoom.on_clicked(on_zoom)
+
+    # ── Pause / Play ──────────────────────────────────────────────────────────
+    if toggle_pause_fn is None:
+        btn_pause.ax.set_visible(False)
+    else:
+        def on_pause(_):
+            playback_state['paused'] = not playback_state['paused']
+            paused = playback_state['paused']
+            btn_pause.label.set_text('Play' if paused else 'Pause')
+            btn_pause.ax.set_facecolor(_ACT if paused else _BG)
+            toggle_pause_fn(paused)
+            fig_ppi.canvas.draw_idle()
+        btn_pause.on_clicked(on_pause)
+
+    # ── A-Scope toggle ────────────────────────────────────────────────────────
+    ascope_on = [False]
+    def on_ascope(_):
+        toggle_ascope_fn()
+        is_open = ascope_ref[0] is not None
+        ascope_on[0] = is_open
+        btn_ascope.label.set_text('[A] A-Scope' if is_open else '[ ] A-Scope')
+        fig_ppi.canvas.draw_idle()
+    btn_ascope.on_clicked(on_ascope)
+
+    # ── Screenshot ────────────────────────────────────────────────────────────
+    def on_screenshot(_):
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        p_ppi = f'cat240_ppi_{ts}.png'
+        fig_ppi.savefig(p_ppi, dpi=150, bbox_inches='tight',
+                        facecolor=fig_ppi.get_facecolor())
+        print(f"  Screenshot: {p_ppi}")
+        asc = ascope_ref[0]
+        if ascope_on[0] and asc is not None:
+            try:
+                p_asc = f'cat240_ascope_{ts}.png'
+                asc.fig.savefig(p_asc, dpi=150, bbox_inches='tight',
+                                facecolor=asc.fig.get_facecolor())
+                print(f"  Screenshot: {p_asc}")
+            except Exception:
+                pass
+    btn_shot.on_clicked(on_screenshot)
+
+    def sync_ascope_btn(is_open: bool):
+        """Synchronisiert den A-Scope-Button-State (z.B. bei X-Schliessen)."""
+        ascope_on[0] = is_open
+        btn_ascope.label.set_text('[A] A-Scope' if is_open else '[ ] A-Scope')
+        fig_ppi.canvas.draw_idle()
+
+    return {'sync_ascope': sync_ascope_btn, 'zoom_active': zoom_active}
+
+
+def _attach_ppi_scroll_zoom(fig_ppi, ax_ppi, ppi):
+    """
+    Scroll-Zoom (Mausrad) zentriert auf Cursor-Position.
+    Doppelklick setzt den Zoom auf den vollen Bereich zurück.
+    """
+    def on_scroll(event):
+        if event.inaxes is not ax_ppi or event.xdata is None:
+            return
+        factor = 0.65 if event.step > 0 else 1.0 / 0.65
+        xlo, xhi = ax_ppi.get_xlim()
+        ylo, yhi = ax_ppi.get_ylim()
+        x0, y0   = event.xdata, event.ydata
+        ax_ppi.set_xlim(x0 + (xlo - x0) * factor, x0 + (xhi - x0) * factor)
+        ax_ppi.set_ylim(y0 + (ylo - y0) * factor, y0 + (yhi - y0) * factor)
+        fig_ppi.canvas.draw_idle()
+
+    def on_dblclick(event):
+        if event.inaxes is ax_ppi and getattr(event, 'dblclick', False):
+            r = ppi.max_range_cells * 1.1
+            ax_ppi.set_xlim(-r, r)
+            ax_ppi.set_ylim(-r, r)
+            fig_ppi.canvas.draw_idle()
+
+    fig_ppi.canvas.mpl_connect('scroll_event',        on_scroll)
+    fig_ppi.canvas.mpl_connect('button_press_event',  on_dblclick)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main analysis function
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1321,10 +1881,10 @@ def _setup_ppi_overlay(ascope: 'AScope', az_line, range_ring, ppi_tick, ppi_obj,
 
 
 def _attach_ppi_readout(fig, ax, ppi):
-    """Adds cursor readout (angle + distance) below the PPI."""
-    txt = fig.text(0.5, 0.005, 'Bearing: —   Dist: —',
-                   ha='center', va='bottom', color='#00ff41',
-                   fontsize=10, fontfamily='monospace',
+    """Adds cursor readout (bearing + distance) in the button row (right side)."""
+    txt = fig.text(0.54, 0.0325, 'Bearing: —   Dist: —',
+                   ha='left', va='center', color='#00ff41',
+                   fontsize=9, fontfamily='monospace',
                    transform=fig.transFigure)
 
     def on_move(event):
@@ -1348,7 +1908,8 @@ def analyze_pcap(filepath: str, display: bool = True,
                  save_path: Optional[str] = None,
                  verbose: bool = True,
                  initial_azimuth: float = 0.0,
-                 filter_stream: Optional[Tuple[str, int]] = None) -> List[Cat240Message]:
+                 filter_stream: Optional[Tuple[str, int]] = None,
+                 log_compress: bool = False) -> List[Cat240Message]:
     """
     Reads a PCAP file, decodes all CAT240 packets and
     optionally displays PPI + A-Scope.
@@ -1398,10 +1959,16 @@ def analyze_pcap(filepath: str, display: bool = True,
         except Exception:
             errors += 1
 
+    compressed_count = sum(1 for m in messages if m.compression)
     print(f"\n  Total packets:       {pkt_count}")
     print(f"  CAT240 messages:     {cat240_count}")
     print(f"  Errors:              {errors}")
     print(f"  Max. cells/azimuth:    {max_cells}")
+    if compressed_count:
+        print(f"  *** WARNING: {compressed_count} messages have log compression flag set ***")
+        print(f"  *** Amplitude values are logarithmically encoded, not linear!        ***")
+    else:
+        print(f"  Compression:         none (linear amplitude)")
 
     if messages:
         az_values = [m.start_azimuth_deg for m in messages]
@@ -1410,6 +1977,7 @@ def analyze_pcap(filepath: str, display: bool = True,
 
     if display or save_path:
         # ── PPI window ────────────────────────────────────────────────────────
+        plt.rcParams['toolbar'] = 'None'
         fig_ppi, ax_ppi = plt.subplots(figsize=(10, 10), facecolor='#0a0a0a',
                                         num='PPI  |  CAT240')
         fig_ppi.canvas.manager.set_window_title('PPI  |  CAT240')
@@ -1432,21 +2000,64 @@ def analyze_pcap(filepath: str, display: bool = True,
             print(f"  PPI saved: {save_path}")
 
         if display:
-            # ── A-Scope window ────────────────────────────────────────────────
-            ascope = AScope(ppi, initial_azimuth=initial_azimuth)
-            _setup_ppi_overlay(ascope, az_line, range_ring, ppi_tick, ppi, fig_ppi)
-            ascope.render()
+            ascope_ref      = [None]
+            ascope_instance = [None]
+
+            def _toggle_ascope_static():
+                if ascope_ref[0] is not None:
+                    old_asc = ascope_ref[0]
+                    ascope_ref[0] = None
+                    az_line.set_visible(False)
+                    range_ring.set_visible(False)
+                    ppi_tick.set_data([], [])
+                    fig_ppi.canvas.draw_idle()
+                    old_asc.clear()
+                    _ascope_hide(old_asc.fig)
+                else:
+                    if ascope_instance[0] is None:
+                        a = AScope(ppi, initial_azimuth=initial_azimuth, log_compress=log_compress)
+                        ascope_instance[0] = a
+                        def _on_x_close(_evt):
+                            ascope_ref[0] = None
+                            ascope_instance[0] = None
+                            az_line.set_visible(False)
+                            range_ring.set_visible(False)
+                            ppi_tick.set_data([], [])
+                            t = fig_ppi.canvas.new_timer(interval=50)
+                            def _sync():
+                                ppi_btns['sync_ascope'](False)
+                                t.stop()
+                            t.add_callback(_sync)
+                            t.start()
+                        a.fig.canvas.mpl_connect('close_event', _on_x_close)
+                    ascope_ref[0] = ascope_instance[0]
+                    _setup_ppi_overlay(ascope_ref[0], az_line, range_ring, ppi_tick, ppi, fig_ppi)
+                    ascope_ref[0].render()
+                    _ascope_show(ascope_ref[0].fig)
+
+            playback_state = {'paused': False}
+            ppi_btns = _setup_ppi_buttons(fig_ppi, ax_ppi, ppi, ascope_ref, _toggle_ascope_static,
+                                          playback_state, toggle_pause_fn=None)
+
+            _attach_ppi_scroll_zoom(fig_ppi, ax_ppi, ppi)
 
             # ── PPI click → A-Scope ──────────────────────────────────────────
             def on_ppi_click(event):
+                if ppi_btns['zoom_active'][0]:
+                    return
+                if getattr(event, 'dblclick', False):
+                    return
                 if event.inaxes != ax_ppi or event.xdata is None:
                     return
+                asc = ascope_ref[0]
+                if asc is None:
+                    return
                 if event.button == 3:
-                    _toggle_ascope_mode(fig_ppi, ascope)
+                    _toggle_ascope_mode(fig_ppi, asc)
                     return
                 if event.button != 1:
                     return
-                new_az = ascope.handle_ppi_click(event.xdata, event.ydata)
+                new_az = asc.handle_ppi_click(event.xdata, event.ydata)
                 if new_az is not None:
                     az_rad = np.deg2rad(new_az)
                     az_line.set_data(
@@ -1455,7 +2066,7 @@ def analyze_pcap(filepath: str, display: bool = True,
                     az_line.set_visible(True)
                 else:
                     _t = np.linspace(0, 2*np.pi, 361)
-                    _rc = float(ascope.range_cell)
+                    _rc = float(asc.range_cell)
                     range_ring.set_data(_rc*np.sin(_t), _rc*np.cos(_t))
                     range_ring.set_visible(True)
                 fig_ppi.canvas.draw_idle()
@@ -1478,7 +2089,9 @@ def analyze_pcap(filepath: str, display: bool = True,
 
 def replay_pcap(filepath: str, speed: float = 1.0,
                 initial_azimuth: float = 0.0,
-                filter_stream: Optional[Tuple[str, int]] = None):
+                filter_stream: Optional[Tuple[str, int]] = None,
+                log_compress: bool = False,
+                loop: bool = False):
     """
     Plays back a PCAP file in a time-controlled manner.
     A background thread reads packets with original timing (× speed),
@@ -1504,37 +2117,53 @@ def replay_pcap(filepath: str, speed: float = 1.0,
     print(f"  Selected stream:     {sel_ip}:{sel_port}{mc}")
     print(f"{'='*60}\n")
 
-    decoder    = Cat240Decoder()
-    ppi        = RadarPPI(max_range_cells=1024, az_bins=4096)
-    msg_queue  = queue.Queue(maxsize=50000)
-    state      = {'done': False, 'msgs': 0}
+    decoder       = Cat240Decoder()
+    ppi           = RadarPPI(max_range_cells=1024, az_bins=4096)
+    msg_queue     = queue.Queue(maxsize=50000)
+    state         = {'done': False, 'msgs': 0, 'loop': 0}
+    playback_state = {'paused': False}
+    pause_event   = threading.Event()
+    pause_event.set()   # gesetzt = läuft; gelöscht = pausiert
 
     def reader_thread():
-        try:
-            reader  = PcapReader(filepath)
-            t0_pcap = None
-            t0_real = time.time()
-            for ts, udp, dst_ip, dst_port in reader.packets():
-                if (dst_ip, dst_port) != filter_stream:
-                    continue
-                if t0_pcap is None:
-                    t0_pcap = ts
-                # Original pause between packets scaled by speed
-                elapsed_pcap = ts - t0_pcap
-                elapsed_real = time.time() - t0_real
-                wait = elapsed_pcap / speed - elapsed_real
-                if wait > 0.001:
-                    time.sleep(wait)
-                for msg in decoder.decode_multiple(udp):
-                    msg_queue.put(msg)
-        except Exception as e:
-            print(f"\n  [Replay] Reader thread error: {e}")
+        while True:
+            try:
+                reader  = PcapReader(filepath)
+                t0_pcap = None
+                t0_real = time.time()
+                for ts, udp, dst_ip, dst_port in reader.packets():
+                    if (dst_ip, dst_port) != filter_stream:
+                        continue
+                    pause_event.wait()   # blockiert wenn pausiert
+                    if t0_pcap is None:
+                        t0_pcap = ts
+                        t0_real = time.time()   # Zeitreferenz nach Pause neu setzen
+                    # Original pause between packets scaled by speed
+                    elapsed_pcap = ts - t0_pcap
+                    elapsed_real = time.time() - t0_real
+                    wait = elapsed_pcap / speed - elapsed_real
+                    if wait > 0.001:
+                        time.sleep(wait)
+                    for msg in decoder.decode_multiple(udp):
+                        msg_queue.put(msg)
+            except Exception as e:
+                print(f"\n  [Replay] Reader thread error: {e}")
+                break
+            print(f"\n  [Replay] Loop {state['loop'] + 1} complete. {state['msgs']} azimuths.")
+            if not loop:
+                break
+            # Naechsten Durchlauf vorbereiten: Queue leeren lassen, dann PPI leeren
+            while not msg_queue.empty():
+                time.sleep(0.1)
+            ppi.clear()
+            state['msgs'] = 0
+            state['loop'] += 1
         state['done'] = True
-        print(f"\n  [Replay] File read complete. {state['msgs']} azimuths.")
 
     threading.Thread(target=reader_thread, daemon=True).start()
 
     # PPI window
+    plt.rcParams['toolbar'] = 'None'
     fig_ppi, ax_ppi = plt.subplots(figsize=(10, 10), facecolor='#0a0a0a',
                                     num='PPI  |  CAT240 Replay')
     fig_ppi.canvas.manager.set_window_title('PPI  |  CAT240 Replay')
@@ -1544,7 +2173,8 @@ def replay_pcap(filepath: str, speed: float = 1.0,
     # All overlays must be added to the axis AFTERWARDS.
     ppi.render(ax_ppi, title=f"CAT240 Replay  |  {speed}x")
 
-    ascope = AScope(ppi, initial_azimuth=initial_azimuth)
+    ascope_ref      = [None]
+    ascope_instance = [None]
 
     # Selection line (click) + range ring + cursor crosshair
     az_rad0 = np.deg2rad(initial_azimuth)
@@ -1555,16 +2185,64 @@ def replay_pcap(filepath: str, speed: float = 1.0,
     range_ring, = ax_ppi.plot([], [], color='#00aaff', linewidth=1.5,
                                linestyle='-', visible=False)
     ppi_tick, = ax_ppi.plot([], [], color='#ff4444', linewidth=2.0, solid_capstyle='round')
-    _setup_ppi_overlay(ascope, az_sel_line, range_ring, ppi_tick, ppi, fig_ppi)
+
+    def _hide_ppi_overlays_replay():
+        az_sel_line.set_visible(False)
+        range_ring.set_visible(False)
+        ppi_tick.set_data([], [])
+
+    def _toggle_ascope_replay():
+        if ascope_ref[0] is not None:
+            old_asc = ascope_ref[0]
+            ascope_ref[0] = None
+            _hide_ppi_overlays_replay()
+            old_asc.clear()
+            _ascope_hide(old_asc.fig)
+        else:
+            if ascope_instance[0] is None:
+                a = AScope(ppi, initial_azimuth=initial_azimuth, log_compress=log_compress)
+                ascope_instance[0] = a
+                def _on_x_close(_evt):
+                    ascope_ref[0] = None
+                    ascope_instance[0] = None
+                    _hide_ppi_overlays_replay()
+                    t = fig_ppi.canvas.new_timer(interval=50)
+                    def _sync():
+                        ppi_btns['sync_ascope'](False)
+                        t.stop()
+                    t.add_callback(_sync)
+                    t.start()
+                a.fig.canvas.mpl_connect('close_event', _on_x_close)
+            ascope_ref[0] = ascope_instance[0]
+            _setup_ppi_overlay(ascope_ref[0], az_sel_line, range_ring, ppi_tick, ppi, fig_ppi)
+            ascope_ref[0].render()
+            _ascope_show(ascope_ref[0].fig)
+
+    def _toggle_pause_replay(paused: bool):
+        if paused:
+            pause_event.clear()
+        else:
+            pause_event.set()
+
+    ppi_btns = _setup_ppi_buttons(fig_ppi, ax_ppi, ppi, ascope_ref, _toggle_ascope_replay,
+                                  playback_state, toggle_pause_fn=_toggle_pause_replay)
+    _attach_ppi_scroll_zoom(fig_ppi, ax_ppi, ppi)
 
     def on_ppi_click(event):
+        if ppi_btns['zoom_active'][0]:
+            return
+        if getattr(event, 'dblclick', False):
+            return
         if event.inaxes != ax_ppi or event.xdata is None:
             return
+        asc = ascope_ref[0]
+        if asc is None:
+            return
         if event.button == 3:
-            _toggle_ascope_mode(fig_ppi, ascope)
+            _toggle_ascope_mode(fig_ppi, asc)
             return
         if event.button == 1:
-            new_az = ascope.handle_ppi_click(event.xdata, event.ydata)
+            new_az = asc.handle_ppi_click(event.xdata, event.ydata)
             if new_az is not None:
                 az_rad = np.deg2rad(new_az)
                 az_sel_line.set_data(
@@ -1573,7 +2251,7 @@ def replay_pcap(filepath: str, speed: float = 1.0,
                 az_sel_line.set_visible(True)
             else:
                 _t = np.linspace(0, 2*np.pi, 361)
-                _rc = float(ascope.range_cell)
+                _rc = float(asc.range_cell)
                 range_ring.set_data(_rc*np.sin(_t), _rc*np.cos(_t))
                 range_ring.set_visible(True)
             fig_ppi.canvas.draw_idle()
@@ -1581,6 +2259,8 @@ def replay_pcap(filepath: str, speed: float = 1.0,
     fig_ppi.canvas.mpl_connect('button_press_event', on_ppi_click)
 
     def update(_):
+        if playback_state['paused']:
+            return []
         try:
             while True:
                 msg = msg_queue.get_nowait()
@@ -1589,10 +2269,17 @@ def replay_pcap(filepath: str, speed: float = 1.0,
         except Exception:
             pass
 
-        status = " [DONE]" if state['done'] else ""
+        if state['done']:
+            status = " [DONE]"
+        elif loop and state['loop'] > 0:
+            status = f" [Loop {state['loop'] + 1}]"
+        else:
+            status = ""
         ppi.render(ax_ppi,
                    title=f"CAT240 Replay  |  {speed}x{status}")
-        ascope.render()
+        asc = ascope_ref[0]
+        if asc is not None:
+            asc.render()
         return []
 
     print(f"\n  Replay: {filepath}")
@@ -1614,7 +2301,8 @@ def replay_pcap(filepath: str, speed: float = 1.0,
 def live_stream(host: str = '0.0.0.0', port: int = 5000,
                 multicast_group: Optional[str] = None,
                 update_interval: float = 0.5,
-                initial_azimuth: float = 0.0):
+                initial_azimuth: float = 0.0,
+                log_compress: bool = False):
     """
     Receives CAT240 datagrams live via UDP and updates
     PPI + A-Scope in real-time.
@@ -1666,15 +2354,18 @@ def live_stream(host: str = '0.0.0.0', port: int = 5000,
     t.start()
 
     # PPI window
+    plt.rcParams['toolbar'] = 'None'
     fig_ppi, ax_ppi = plt.subplots(figsize=(10, 10), facecolor='#0a0a0a',
                                     num='PPI  |  CAT240 Live')
+    fig_ppi.canvas.manager.set_window_title('PPI  |  CAT240 Live')
 
     # Initial render – ax.clear() is called only once here.
     # Add all overlays AFTERWARDS.
     ppi.render(ax_ppi, title=f"CAT240 Live PPI  |  Port {port}")
 
-    # A-Scope window
-    ascope = AScope(ppi, initial_azimuth=initial_azimuth)
+    ascope_ref      = [None]
+    ascope_instance = [None]
+    playback_state  = {'paused': False}
 
     # Azimuth line + range ring (after initial render!)
     az_rad0 = np.deg2rad(initial_azimuth)
@@ -1685,17 +2376,59 @@ def live_stream(host: str = '0.0.0.0', port: int = 5000,
     range_ring, = ax_ppi.plot([], [], color='#00aaff', linewidth=1.5,
                                linestyle='-', visible=False)
     ppi_tick, = ax_ppi.plot([], [], color='#ff4444', linewidth=2.0, solid_capstyle='round')
-    _setup_ppi_overlay(ascope, az_line, range_ring, ppi_tick, ppi, fig_ppi)
+
+    def _hide_ppi_overlays_live():
+        az_line.set_visible(False)
+        range_ring.set_visible(False)
+        ppi_tick.set_data([], [])
+
+    def _toggle_ascope_live():
+        if ascope_ref[0] is not None:
+            old_asc = ascope_ref[0]
+            ascope_ref[0] = None
+            _hide_ppi_overlays_live()
+            old_asc.clear()
+            _ascope_hide(old_asc.fig)
+        else:
+            if ascope_instance[0] is None:
+                a = AScope(ppi, initial_azimuth=initial_azimuth, log_compress=log_compress)
+                ascope_instance[0] = a
+                def _on_x_close(_evt):
+                    ascope_ref[0] = None
+                    ascope_instance[0] = None
+                    _hide_ppi_overlays_live()
+                    t = fig_ppi.canvas.new_timer(interval=50)
+                    def _sync():
+                        ppi_btns['sync_ascope'](False)
+                        t.stop()
+                    t.add_callback(_sync)
+                    t.start()
+                a.fig.canvas.mpl_connect('close_event', _on_x_close)
+            ascope_ref[0] = ascope_instance[0]
+            _setup_ppi_overlay(ascope_ref[0], az_line, range_ring, ppi_tick, ppi, fig_ppi)
+            ascope_ref[0].render()
+            _ascope_show(ascope_ref[0].fig)
+
+    ppi_btns = _setup_ppi_buttons(fig_ppi, ax_ppi, ppi, ascope_ref, _toggle_ascope_live,
+                                  playback_state, toggle_pause_fn=lambda p: None)
+    _attach_ppi_scroll_zoom(fig_ppi, ax_ppi, ppi)
 
     def on_ppi_click(event):
+        if ppi_btns['zoom_active'][0]:
+            return
+        if getattr(event, 'dblclick', False):
+            return
         if event.inaxes != ax_ppi or event.xdata is None:
             return
+        asc = ascope_ref[0]
+        if asc is None:
+            return
         if event.button == 3:
-            _toggle_ascope_mode(fig_ppi, ascope)
+            _toggle_ascope_mode(fig_ppi, asc)
             return
         if event.button != 1:
             return
-        new_az = ascope.handle_ppi_click(event.xdata, event.ydata)
+        new_az = asc.handle_ppi_click(event.xdata, event.ydata)
         if new_az is not None:
             az_rad = np.deg2rad(new_az)
             az_line.set_data(
@@ -1704,7 +2437,7 @@ def live_stream(host: str = '0.0.0.0', port: int = 5000,
             az_line.set_visible(True)
         else:
             _t = np.linspace(0, 2*np.pi, 361)
-            _rc = float(ascope.range_cell)
+            _rc = float(asc.range_cell)
             range_ring.set_data(_rc*np.sin(_t), _rc*np.cos(_t))
             range_ring.set_visible(True)
         fig_ppi.canvas.draw_idle()
@@ -1713,8 +2446,12 @@ def live_stream(host: str = '0.0.0.0', port: int = 5000,
     _attach_ppi_readout(fig_ppi, ax_ppi, ppi)
 
     def update(_):
+        if playback_state['paused']:
+            return az_line,
         ppi.render(ax_ppi, title=f"CAT240 Live PPI  |  Port {port}")
-        ascope.render()
+        asc = ascope_ref[0]
+        if asc is not None:
+            asc.render()
         return az_line,
 
     ani = animation.FuncAnimation(fig_ppi, update,
@@ -1744,9 +2481,11 @@ def main():
     parser.add_argument('--stream',     type=str,   default=None,      help='Stream filter IP:PORT for --file/--replay')
     parser.add_argument('--azimuth',    type=float, default=0.0,       help='Start azimuth for A-Scope in degrees (default: 0)')
     parser.add_argument('--speed',      type=float, default=1.0,       help='Playback speed for --replay (default: 1.0)')
-    parser.add_argument('--no-display', action='store_true',           help='Do not show PPI/A-Scope window')
-    parser.add_argument('--save',       metavar='PNG',                 help='Save PPI as PNG file')
-    parser.add_argument('--verbose',    action='store_true', default=True)
+    parser.add_argument('--loop',       action='store_true',           help='Loop --replay continuously (clears PPI on each restart)')
+    parser.add_argument('--no-display',   action='store_true',         help='Do not show PPI/A-Scope window')
+    parser.add_argument('--save',         metavar='PNG',               help='Save PPI as PNG file')
+    parser.add_argument('--log-compress', action='store_true',         help='Show log-compressed A-Scope overlay (0–255, P₀ auto-estimated)')
+    parser.add_argument('--verbose',      action='store_true', default=True)
 
     args = parser.parse_args()
 
@@ -1777,11 +2516,14 @@ def main():
             default_multicast = args.multicast or '',
         )
         live_stream(host=host, port=port, multicast_group=multicast,
-                    initial_azimuth=args.azimuth)
+                    initial_azimuth=args.azimuth,
+                    log_compress=args.log_compress)
     elif args.replay:
         replay_pcap(filepath=args.replay, speed=args.speed,
                     initial_azimuth=args.azimuth,
-                    filter_stream=filter_stream)
+                    filter_stream=filter_stream,
+                    log_compress=args.log_compress,
+                    loop=args.loop)
     else:
         analyze_pcap(
             filepath         = args.file,
@@ -1790,6 +2532,7 @@ def main():
             verbose          = args.verbose,
             initial_azimuth  = args.azimuth,
             filter_stream    = filter_stream,
+            log_compress     = args.log_compress,
         )
 
 

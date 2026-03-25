@@ -68,6 +68,9 @@ python cat240_analyzer.py --replay Data/recording.pcapng
 
 # 20× faster:
 python cat240_analyzer.py --replay Data/recording.pcapng --speed 20
+
+# Loop continuously (PPI cleared on each restart):
+python cat240_analyzer.py --replay Data/recording.pcapng --loop --speed 10
 ```
 
 #### Live UDP reception
@@ -89,6 +92,17 @@ python cat240_analyzer.py --live --port 4379 --multicast 239.0.0.1
 | `--no-display` | Decode only, no GUI |
 | `--stream IP:PORT` | Pre-select a UDP stream (skip interactive prompt) |
 | `--speed X` | Replay speed multiplier (default: 1.0) |
+| `--loop` | Loop `--replay` continuously; PPI is cleared on each restart |
+| `--log-compress` | Add soft-log overlay to A-Scope (second Y-axis, 0–255) |
+
+#### PPI buttons
+
+| Button | Effect |
+|---|---|
+| `Pause` / `Play` | Pause or resume replay / live mode |
+| `Zoom` | Activate rectangle zoom — drag to select area, releases and applies zoom automatically. Click again to cancel. Cursor changes to crosshair while active. |
+| `[ ] A-Scope` / `[A] A-Scope` | Open or close the A-Scope window |
+| `Screenshot` | Save PPI and A-Scope (if open) as PNG files |
 
 #### PPI / A-Scope interaction
 
@@ -96,6 +110,8 @@ python cat240_analyzer.py --live --port 4379 --multicast 239.0.0.1
 |---|---|
 | Left-click in PPI | A-Scope shows amplitude profile at that azimuth |
 | Right-click in PPI | Toggle A-Scope mode: amplitude vs. range ↔ amplitude vs. angle |
+| Scroll wheel in PPI | Zoom in / out centred on cursor |
+| Double-click in PPI | Reset zoom to full range |
 | Mouse over A-Scope | Measurement cursor with cell number and amplitude |
 
 ---
@@ -113,6 +129,12 @@ python cat240_stream_info.py Data/recording.pcapng --packets 10000
 
 # Specify output path for the Markdown report:
 python cat240_stream_info.py Data/recording.pcapng --output report.md
+
+# Also generate a PDF report (saved next to the Markdown file):
+python cat240_stream_info.py Data/recording.pcapng --pdf
+
+# PDF with custom path:
+python cat240_stream_info.py Data/recording.pcapng --pdf report.pdf
 ```
 
 The report includes per-stream:

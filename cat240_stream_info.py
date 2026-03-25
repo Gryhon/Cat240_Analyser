@@ -261,6 +261,8 @@ class PcapReader:
 
     def __init__(self, filepath: str):
         self.filepath = filepath
+        # IP-Fragment-Puffer: {(src_ip, dst_ip, proto, ip_id): {'frags': {offset: bytes}, 'last_off': int}}
+        self._frag_buffer: dict = {}
 
     def packets(self):
         """Yields (timestamp, udp_payload, dst_ip, dst_port)."""
@@ -293,20 +295,49 @@ class PcapReader:
             if len(ip_hdr) < 20: return None
             ihl = (ip_hdr[0] & 0x0F) * 4
             if ip_hdr[9] != 17: return None  # UDP
-            dst_ip   = '.'.join(str(b) for b in ip_hdr[16:20])
-            udp_off  = ip_start + ihl
-            udp_hdr  = raw[udp_off:udp_off + 8]
-            if len(udp_hdr) < 8: return None
-            dst_port = struct.unpack('>H', udp_hdr[2:4])[0]
-            udp_len  = struct.unpack('>H', udp_hdr[4:6])[0]
-            return raw[udp_off + 8: udp_off + udp_len], dst_ip, dst_port
+            src_ip    = '.'.join(str(b) for b in ip_hdr[12:16])
+            dst_ip    = '.'.join(str(b) for b in ip_hdr[16:20])
+            ip_id     = struct.unpack('>H', ip_hdr[4:6])[0]
+            flags_frag = struct.unpack('>H', ip_hdr[6:8])[0]
+            mf        = bool((flags_frag >> 13) & 1)
+            frag_off  = (flags_frag & 0x1FFF) * 8
+            ip_payload = raw[ip_start + ihl:]
+
+            if not mf and frag_off == 0:
+                # Nicht fragmentiert
+                if len(ip_payload) < 8: return None
+                dst_port = struct.unpack('>H', ip_payload[2:4])[0]
+                udp_len  = struct.unpack('>H', ip_payload[4:6])[0]
+                return ip_payload[8:udp_len], dst_ip, dst_port
+
+            # IP-Fragmentierung: Fragmente sammeln und reassemblieren
+            key = (src_ip, dst_ip, 17, ip_id)
+            if key not in self._frag_buffer:
+                self._frag_buffer[key] = {'frags': {}, 'last_off': -1}
+            entry = self._frag_buffer[key]
+            entry['frags'][frag_off] = ip_payload
+            if not mf:
+                entry['last_off'] = frag_off
+            if entry['last_off'] < 0:
+                return None
+            offsets = sorted(entry['frags'].keys())
+            total = bytearray()
+            for off in offsets:
+                if off != len(total): return None  # Lücke
+                total.extend(entry['frags'][off])
+            del self._frag_buffer[key]
+            if len(total) < 8: return None
+            dst_port = struct.unpack('>H', bytes(total[2:4]))[0]
+            udp_len  = struct.unpack('>H', bytes(total[4:6]))[0]
+            return bytes(total[8:udp_len]), dst_ip, dst_port
         except Exception:
             return None
 
     def _read_pcap(self, f, magic):
         endian = '<' if magic == self.PCAP_MAGIC_LE else '>'
-        hdr = f.read(20)
-        link_type = struct.unpack(endian + 'I', hdr[16:20])[0] if len(hdr) >= 20 else 1
+        # packets() seeks to 0 before calling us; read the full 24-byte global header
+        hdr = f.read(24)
+        link_type = struct.unpack(endian + 'I', hdr[20:24])[0] if len(hdr) >= 24 else 1
         while True:
             rec = f.read(16)
             if len(rec) < 16: break
@@ -776,6 +807,11 @@ def print_report_plain(filepath, streams, total_udp, non_cat240):
         print(f"  SAC/SIC       : {dict(s.sac_sic.most_common(3))}")
         print(f"  Cells/azimuth : {dict(s.cell_counts.most_common())}")
         print(f"  Bit/cell      : {dict(s.cell_bits.most_common())}")
+        comp_str = " / ".join(
+            ("uncompressed" if c == 0 else "LOG COMPRESSED") + f" ({n:,}x)"
+            for c, n in s.comp_counts.most_common()
+        )
+        print(f"  Compression   : {comp_str}")
         print(f"  CELL_DUR raw  : {dict(s.crg_counts.most_common())}")
         if 'spokes_per_rev' in az:
             print(f"  Az/rev        : ~{az['spokes_per_rev']}")
