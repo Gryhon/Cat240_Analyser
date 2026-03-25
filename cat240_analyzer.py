@@ -444,11 +444,26 @@ class RadarPPI:
         self._mesh    = None
         self._mesh_ax = None
         # Cell size in metres (determined from first decoded packet)
-        self.cell_size_m = 0.0
+        self.cell_size_m      = 0.0
+        self._cell_duration_ns = 0.0   # Referenzwert für Range-Wechsel-Erkennung
+        self.range_resets      = 0     # Zählt automatische Grid-Resets
 
     def add_message(self, msg: Cat240Message):
         """Inserts a CAT240 azimuth into the PPI grid."""
         with self._lock:
+            # Range-Wechsel erkennen: cell_duration_ns hat sich um mehr als 1% geändert
+            if msg.cell_duration_ns > 0:
+                if self._cell_duration_ns == 0.0:
+                    self._cell_duration_ns = msg.cell_duration_ns
+                elif abs(msg.cell_duration_ns - self._cell_duration_ns) / self._cell_duration_ns > 0.01:
+                    # Grid löschen und Referenzwerte aktualisieren
+                    self.grid[:] = 0
+                    self._msg_count = 0
+                    self._spoke_count.clear()
+                    self._cell_duration_ns = msg.cell_duration_ns
+                    self.cell_size_m = 299_792_458.0 * msg.cell_duration_ns * 1e-9 / 2.0
+                    self.range_resets += 1
+
             az_center = (msg.start_azimuth_deg + msg.end_azimuth_deg) / 2.0
             az_idx = int((az_center / 360.0) * self.az_bins) % self.az_bins
 
@@ -464,7 +479,8 @@ class RadarPPI:
             self.grid[az_idx, r_start:r_end] = cells[:n]
             self._msg_count += 1
             if self.cell_size_m == 0.0 and msg.cell_duration_ns > 0:
-                self.cell_size_m = 299_792_458.0 * msg.cell_duration_ns * 1e-9 / 2.0
+                self.cell_size_m       = 299_792_458.0 * msg.cell_duration_ns * 1e-9 / 2.0
+                self._cell_duration_ns = msg.cell_duration_ns
 
     def render(self, ax, title: str = "CAT240 PPI", colormap: str = "plasma"):
         """Renders the PPI image onto a matplotlib axis."""
@@ -516,7 +532,8 @@ class RadarPPI:
             if norm is not None:
                 self._mesh.set_norm(norm)
 
-        ax.set_title(f'{title}  |  {msg_count} azimuths', color='white', fontsize=10)
+        reset_info = f'  |  {self.range_resets}× Range-Reset' if self.range_resets > 0 else ''
+        ax.set_title(f'{title}  |  {msg_count} azimuths{reset_info}', color='white', fontsize=10)
         return self._mesh
 
     def clear(self):
@@ -620,12 +637,18 @@ class AScope:
                       edgecolor=self.WM, linewidth=1.2, alpha=0.0))
 
         self._mode_confirmed = True   # False until user clicks in PPI after a mode change
+        self._zoom_xlim: Optional[tuple] = None   # (lo, hi) wenn gezoomt, sonst None
+        self._pan_press_px:   Optional[float] = None   # Maus-X in Pixel beim Drücken
+        self._pan_xlim_press: Optional[tuple] = None   # xlim beim Drücken
+        self._pan_moved:      bool = False             # Wurde die Maus weit genug bewegt?
 
         self._update_title()
 
-        self.fig.canvas.mpl_connect('motion_notify_event', self._on_mouse_move)
-        self.fig.canvas.mpl_connect('axes_leave_event',    self._on_axes_leave)
-        self.fig.canvas.mpl_connect('button_press_event',  self._on_click)
+        self.fig.canvas.mpl_connect('motion_notify_event',  self._on_mouse_move)
+        self.fig.canvas.mpl_connect('axes_leave_event',     self._on_axes_leave)
+        self.fig.canvas.mpl_connect('button_press_event',   self._on_click)
+        self.fig.canvas.mpl_connect('button_release_event', self._on_button_release)
+        self.fig.canvas.mpl_connect('scroll_event',         self._on_scroll)
 
     # ── Style ─────────────────────────────────────────────────────────────────
 
@@ -658,8 +681,9 @@ class AScope:
             else:
                 detail = f'Range Cell {rc}'
         mode_lbl = 'Amp vs. Range' if self.mode == 'range' else 'Amp vs. Angle'
+        zoom_hint = '  |  Scroll: zoom  |  Dbl-click: reset' if self._zoom_xlim is not None else '  |  Scroll: zoom'
         self.fig.suptitle(
-            f'A-Scope  [{mode_lbl}]  |  {detail}  |  L-click: FWHM  |  R-click: span selection',
+            f'A-Scope  [{mode_lbl}]  |  {detail}  |  L-click: FWHM  |  R-click: span selection{zoom_hint}',
             color=self.GREEN, fontsize=9, y=0.97)
 
     # ── Render ────────────────────────────────────────────────────────────────
@@ -688,6 +712,8 @@ class AScope:
         vmax = cells.max() if cells.max() > 0 else 1.0
         self.ax.set_xlim(0, n)
         self.ax.set_ylim(0, vmax * 1.12)
+        if self._zoom_xlim is not None:
+            self._apply_zoom(cells, np.arange(n, dtype=float))
         self._update_title()
         if self._cursor_x is not None:
             self._refresh_cursor(self._cursor_x, cells, x_max=n)
@@ -711,6 +737,9 @@ class AScope:
         vmax = ring.max() if ring.max() > 0 else 1.0
         self.ax.set_xlim(0, 360)
         self.ax.set_ylim(0, vmax * 1.12)
+        x_arr = np.linspace(0.0, 360.0, n, endpoint=False)
+        if self._zoom_xlim is not None:
+            self._apply_zoom(ring, x_arr)
         self._update_title()
         if self._cursor_x is not None:
             self._refresh_cursor(self._cursor_x, ring, x_max=360)
@@ -719,9 +748,74 @@ class AScope:
             self._update_az_selection()
         self.fig.canvas.draw_idle()
 
+    # ── Zoom ──────────────────────────────────────────────────────────────────
+
+    def _on_scroll(self, event):
+        """Scrollrad-Zoom auf der X-Achse, zentriert auf Cursor-Position."""
+        if event.inaxes != self.ax or event.xdata is None:
+            return
+        factor = 0.6 if event.step > 0 else 1.0 / 0.6
+        xlo, xhi = self.ax.get_xlim()
+        x = event.xdata
+        new_lo = x - (x - xlo) * factor
+        new_hi = x + (xhi - x) * factor
+        # Grenzen des aktuellen Modus
+        x_max = 360.0 if self.mode == 'azimuth' else float(
+            len(self.ppi.get_spoke(self.azimuth)[0]) or 1)
+        new_lo = max(0.0, new_lo)
+        new_hi = min(x_max, new_hi)
+        if new_hi - new_lo < 2:   # Minimalzoom
+            return
+        self._zoom_xlim = (new_lo, new_hi)
+        if self.mode == 'range':
+            data, _ = self.ppi.get_spoke(self.azimuth)
+            x_arr = np.arange(len(data), dtype=float)
+        else:
+            data = self.ppi.get_ring(self.range_cell)
+            x_arr = np.linspace(0.0, 360.0, len(data), endpoint=False)
+        self._apply_zoom(data, x_arr)
+        self._update_title()
+        self.fig.canvas.draw_idle()
+
+    def _apply_zoom(self, data: np.ndarray, x_arr: np.ndarray):
+        """Setzt xlim auf _zoom_xlim und passt ylim an die sichtbaren Daten an."""
+        if self._zoom_xlim is None:
+            return
+        lo, hi = self._zoom_xlim
+        self.ax.set_xlim(lo, hi)
+        if len(data) > 0:
+            mask = (x_arr >= lo) & (x_arr <= hi)
+            if mask.any():
+                vmax = float(data[mask].max()) if data[mask].max() > 0 else 1.0
+                self.ax.set_ylim(0, vmax * 1.15)
+
     # ── Interaction ───────────────────────────────────────────────────────────
 
     def _on_mouse_move(self, event):
+        # ── Rechts-Drag Pan ───────────────────────────────────────────────────
+        if self._pan_press_px is not None and event.x is not None:
+            dx_px = event.x - self._pan_press_px
+            if abs(dx_px) > 3:
+                self._pan_moved = True
+            if self._pan_moved and self._pan_xlim_press is not None:
+                ax_w = self.ax.get_window_extent().width
+                if ax_w > 0:
+                    lo0, hi0 = self._pan_xlim_press
+                    shift = -dx_px / ax_w * (hi0 - lo0)
+                    x_max = 360.0 if self.mode == 'azimuth' else float(
+                        len(self.ppi.get_spoke(self.azimuth)[0]) or 1)
+                    new_lo = max(0.0, lo0 + shift)
+                    new_hi = min(x_max, hi0 + shift)
+                    # Breite erhalten, falls an Rand angestoßen
+                    if new_lo == 0.0:
+                        new_hi = min(x_max, hi0 - lo0)
+                    if new_hi == x_max:
+                        new_lo = max(0.0, x_max - (hi0 - lo0))
+                    self._zoom_xlim = (new_lo, new_hi)
+                    self.ax.set_xlim(new_lo, new_hi)
+                    self.fig.canvas.draw_idle()
+                return   # Cursor-Overlay während Pan unterdrücken
+
         if event.inaxes != self.ax or event.xdata is None:
             return
         self._cursor_x = event.xdata
@@ -745,12 +839,25 @@ class AScope:
 
     def _on_click(self, event):
         """Click handler for the A-Scope.
-        Left-click  : FWHM measurement of the nearest peak (both modes).
-        Right-click : manual span selection – first click sets start,
-                      second click sets end (azimuth mode only).
+        Left-click       : FWHM measurement of the nearest peak (both modes).
+        Left-dblclick    : Zoom zurücksetzen.
+        Right-drag       : Pan (Ansicht verschieben).
+        Right-click (no drag, azimuth mode) : manual span selection.
         """
         if event.inaxes != self.ax or event.xdata is None:
             return
+
+        if event.dblclick and event.button == 1:
+            # Doppelklick → Zoom zurücksetzen
+            self._zoom_xlim = None
+            self.render()
+            return
+
+        if event.button == 3:
+            # Rechte Maustaste gedrückt → Pan-Start merken
+            self._pan_press_px   = float(event.x)
+            self._pan_xlim_press = self.ax.get_xlim()
+            self._pan_moved      = False
 
         if event.button == 1:
             # Left-click → FWHM
@@ -758,21 +865,40 @@ class AScope:
             self.fig.canvas.draw_idle()
 
         elif event.button == 3 and self.mode == 'azimuth':
-            # Right-click → manual span selection
-            x = float(event.xdata)
-            if self._az_sel_start is None or self._az_sel_end is not None:
-                # Begin new selection
-                self._clear_az_selection()
-                self._az_sel_start = x
-                self._az_sel_vline_s.set_xdata([x, x])
-                self._az_sel_vline_s.set_visible(True)
-            else:
-                # Set end
-                self._az_sel_end = x
-                self._az_sel_vline_e.set_xdata([x, x])
-                self._az_sel_vline_e.set_visible(True)
-                self._update_az_selection()
-            self.fig.canvas.draw_idle()
+            # Right-click (ohne Drag) → manual span selection
+            # wird erst in button_release ausgewertet
+            pass
+
+    def _on_button_release(self, event):
+        """Rechte Maustaste losgelassen: Pan abschließen oder Span-Selection auslösen."""
+        if event.button != 3:
+            return
+        moved = self._pan_moved
+        # Pan-Zustand zurücksetzen
+        self._pan_press_px   = None
+        self._pan_xlim_press = None
+        self._pan_moved      = False
+
+        if moved:
+            return   # War ein Drag → keine Span-Selection
+
+        # Kein Drag → Span-Selection (azimuth mode only)
+        if event.inaxes != self.ax or event.xdata is None:
+            return
+        if self.mode != 'azimuth':
+            return
+        x = float(event.xdata)
+        if self._az_sel_start is None or self._az_sel_end is not None:
+            self._clear_az_selection()
+            self._az_sel_start = x
+            self._az_sel_vline_s.set_xdata([x, x])
+            self._az_sel_vline_s.set_visible(True)
+        else:
+            self._az_sel_end = x
+            self._az_sel_vline_e.set_xdata([x, x])
+            self._az_sel_vline_e.set_visible(True)
+            self._update_az_selection()
+        self.fig.canvas.draw_idle()
 
     # ── Width measurement ─────────────────────────────────────────────────────
 
@@ -873,6 +999,15 @@ class AScope:
         self._wm_fill = self.ax.fill_between(
             x_arr, threshold, data, where=mask,
             color=self.WM, alpha=0.18)
+        # Box in die dem Peak gegenüberliegende Ecke stellen
+        xlo, xhi = self.ax.get_xlim()
+        peak_axes_x = (float(x_arr[peak_idx]) - xlo) / (xhi - xlo) if xhi > xlo else 0.5
+        if peak_axes_x < 0.5:
+            self._wm_text.set_position((0.99, 0.97))
+            self._wm_text.set_ha('right')
+        else:
+            self._wm_text.set_position((0.01, 0.97))
+            self._wm_text.set_ha('left')
         self._wm_text.set_text(label)
         self._wm_text.get_bbox_patch().set_alpha(0.85)
 
@@ -1407,7 +1542,7 @@ def replay_pcap(filepath: str, speed: float = 1.0,
 
     # Initial render – creates mesh and calls ax.clear() ONCE.
     # All overlays must be added to the axis AFTERWARDS.
-    ppi.render(ax_ppi, title=f"CAT240 Replay  |  {speed}x  |  0 azimuths")
+    ppi.render(ax_ppi, title=f"CAT240 Replay  |  {speed}x")
 
     ascope = AScope(ppi, initial_azimuth=initial_azimuth)
 
@@ -1456,8 +1591,7 @@ def replay_pcap(filepath: str, speed: float = 1.0,
 
         status = " [DONE]" if state['done'] else ""
         ppi.render(ax_ppi,
-                   title=f"CAT240 Replay  |  {speed}x  |  "
-                         f"{state['msgs']} azimuths{status}")
+                   title=f"CAT240 Replay  |  {speed}x{status}")
         ascope.render()
         return []
 
@@ -1537,7 +1671,7 @@ def live_stream(host: str = '0.0.0.0', port: int = 5000,
 
     # Initial render – ax.clear() is called only once here.
     # Add all overlays AFTERWARDS.
-    ppi.render(ax_ppi, title=f"CAT240 Live PPI  |  Port {port}  |  0 azimuths")
+    ppi.render(ax_ppi, title=f"CAT240 Live PPI  |  Port {port}")
 
     # A-Scope window
     ascope = AScope(ppi, initial_azimuth=initial_azimuth)
@@ -1579,8 +1713,7 @@ def live_stream(host: str = '0.0.0.0', port: int = 5000,
     _attach_ppi_readout(fig_ppi, ax_ppi, ppi)
 
     def update(_):
-        ppi.render(ax_ppi, title=f"CAT240 Live PPI  |  Port {port}  "
-                                  f"|  {stats['msgs']} azimuths")
+        ppi.render(ax_ppi, title=f"CAT240 Live PPI  |  Port {port}")
         ascope.render()
         return az_line,
 
