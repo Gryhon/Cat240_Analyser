@@ -102,7 +102,7 @@ python cat240_analyzer.py --live --port 4379 --multicast 239.0.0.1
 | `Pause` / `Play` | Pause or resume replay / live mode |
 | `Zoom` | Activate rectangle zoom — drag to select area, releases and applies zoom automatically. Click again to cancel. Cursor changes to crosshair while active. |
 | `[ ] A-Scope` / `[A] A-Scope` | Open or close the A-Scope window |
-| `Screenshot` | Save PPI and A-Scope (if open) as PNG files |
+| `Rng` | Toggle A-Scope mode: amplitude vs. range ↔ amplitude vs. angle |
 
 #### PPI / A-Scope interaction
 
