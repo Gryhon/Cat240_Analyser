@@ -879,8 +879,9 @@ def write_markdown(filepath: str, streams: Dict[str, StreamStats],
         az    = _az_stats(s)
         amp   = _amp_stats(s)
 
-        w(f"---")
-        w()
+        if idx > 1:
+            w('<div style="page-break-before: always"></div>')
+            w()
         w(f"## Stream {idx}: `{key}`")
         w()
         w(f"{s.msg_count:,} messages · {dur_s:.1f} s · "
@@ -1093,7 +1094,13 @@ def write_pdf(filepath: str, streams: Dict[str, StreamStats],
         pdf.ln(2)
         pdf.set_text_color(*C_TEXT)
 
+    def _ensure_space(min_mm: float):
+        """Neue Seite wenn verbleibender Platz < min_mm."""
+        if pdf.get_y() + min_mm > pdf.h - pdf.b_margin:
+            pdf.add_page()
+
     def h2(text):
+        _ensure_space(35)   # Überschrift + mind. ein paar Tabellenzeilen
         pdf.ln(3)
         pdf.set_font('Helvetica', 'B', 11)
         pdf.set_text_color(*C_SECTION)
@@ -1105,6 +1112,7 @@ def write_pdf(filepath: str, streams: Dict[str, StreamStats],
         pdf.set_text_color(*C_TEXT)
 
     def h3(text):
+        _ensure_space(30)   # Überschrift + mind. ein paar Tabellenzeilen
         pdf.ln(2)
         pdf.set_font('Helvetica', 'B', 9)
         pdf.set_text_color(*C_SECTION)
@@ -1113,6 +1121,7 @@ def write_pdf(filepath: str, streams: Dict[str, StreamStats],
 
     def kv_table(rows, col_w=(80, 102)):
         """Schlüssel-Wert-Tabelle. rows = [(key, value), ...]"""
+        _ensure_space((1 + len(rows)) * 5 + 4)
         pdf.set_font('Helvetica', 'B', 8)
         pdf.set_fill_color(*C_HEADER)
         pdf.set_text_color(255, 255, 255)
@@ -1130,6 +1139,7 @@ def write_pdf(filepath: str, streams: Dict[str, StreamStats],
 
     def wide_table(headers, rows, col_ws=None):
         """Mehrspaltige Tabelle."""
+        _ensure_space((1 + len(rows)) * 5 + 4)
         n = len(headers)
         if col_ws is None:
             col_ws = [W // n] * n
@@ -1204,6 +1214,8 @@ def write_pdf(filepath: str, streams: Dict[str, StreamStats],
         az    = _az_stats(s)
         amp   = _amp_stats(s)
 
+        if idx > 1:
+            pdf.add_page()
         h2(f'Stream {idx}: {key}')
         pdf.set_font('Helvetica', '', 8)
         pdf.set_text_color(*C_DIM)
@@ -1318,6 +1330,7 @@ def write_pdf(filepath: str, streams: Dict[str, StreamStats],
             COL_RNG = 28     # Breite Spalte "Range"
             COL_CNT = 24     # Breite Spalte "Count"
             BAR_MAX = 110    # max. Balkenbreite mm
+            _ensure_space((1 + len(hist)) * ROW_H + 4)
             # Tabellenkopf
             pdf.set_font('Helvetica', 'B', 8)
             pdf.set_fill_color(*C_HEADER)

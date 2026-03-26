@@ -604,7 +604,7 @@ class RadarPPI:
                 circle = plt.Circle((0, 0), r_cells, color='#00ff41',
                                     fill=False, linewidth=0.5, alpha=0.4)
                 ax.add_patch(circle)
-                txt = ax.text(0, r_cells, f'{r_nm:.0f} nm',
+                txt = ax.text(0, r_cells, f'{r_nm:.0f} NM',
                               color='#00ff41', fontsize=6, ha='center', va='bottom',
                               alpha=0.6)
                 self._range_ring_patches.extend([circle, txt])
@@ -650,13 +650,20 @@ class AScope:
     Right-click in PPI → context menu to switch mode.
     """
 
-    GREEN  = '#00ff41'
-    BG     = '#0a0a0a'
-    GRID   = '#1a3a1a'
-    CURSOR = '#ffcc00'
-    WM     = '#ff44ff'   # width measurement colour
-
+    GREEN    = '#00ff41'
+    BG       = '#0a0a0a'
+    GRID     = '#1a3a1a'
+    CURSOR   = '#ffcc00'
+    WM       = '#ff44ff'   # width measurement colour
     LC_COLOR = '#ffaa00'   # Farbe der Log-Compression-Kurve
+
+    FWHM_HDR   = 'FWHM'
+    CURSOR_HDR = 'Cursor'
+
+    @staticmethod
+    def _row(lbl: str, val: str) -> str:
+        """Zeile: Label linksbündig 10 Zeichen, Wert rechtsbündig 8 Zeichen."""
+        return f'{lbl:<10}{val:>8}'
 
     def __init__(self, ppi: 'RadarPPI', initial_azimuth: float = 0.0,
                  log_compress: bool = False):
@@ -673,12 +680,14 @@ class AScope:
         self._log_compress     = log_compress
         self._p0: float        = 1.0
         self._p0_cache_count: int = -1  # _msg_count bei letzter P0-Schätzung
+        self._show_linear: bool = True
+        self._show_log:    bool = True
 
         self.fig = plt.figure(figsize=(12, 4), facecolor=self.BG)
         self.fig.canvas.manager.set_window_title('A-Scope  |  CAT240')
 
         gs = gridspec.GridSpec(1, 1, figure=self.fig,
-                               left=0.07, right=0.97, top=0.88, bottom=0.13)
+                               left=0.07, right=0.77, top=0.88, bottom=0.17)
         self.ax = self.fig.add_subplot(gs[0])
         self._style_axes()
 
@@ -688,9 +697,9 @@ class AScope:
         self._vline     = self.ax.axvline(x=0, color=self.CURSOR,
                                           linewidth=1.0, linestyle='--',
                                           visible=False)
-        self._info_text = self.ax.text(
-            0.99, 0.97, '', transform=self.ax.transAxes,
-            color=self.CURSOR, fontsize=8, va='top', ha='right',
+        self._info_text = self.fig.text(
+            0.97, 0.90, '', transform=self.fig.transFigure,
+            color=self.CURSOR, fontsize=9, va='top', ha='right',
             fontfamily='monospace',
             bbox=dict(boxstyle='round,pad=0.3', facecolor='#1a1a00',
                       edgecolor=self.CURSOR, alpha=0.85))
@@ -716,12 +725,12 @@ class AScope:
         self._wm_vline_l = None
         self._wm_vline_r = None
         self._wm_fill    = None
-        self._wm_text    = self.ax.text(
-            0.01, 0.97, '', transform=self.ax.transAxes,
-            color=self.WM, fontsize=9, va='top', ha='left',
+        self._wm_text    = self.fig.text(
+            0.97, 0.46, '', transform=self.fig.transFigure,
+            color=self.WM, fontsize=9, va='top', ha='right',
             fontfamily='monospace',
             bbox=dict(boxstyle='round,pad=0.4', facecolor='#1a001a',
-                      edgecolor=self.WM, linewidth=1.2, alpha=0.0))
+                      edgecolor=self.WM, linewidth=1.2, alpha=0.85))
 
         # Zweite Y-Achse für Log-Kompression (nur wenn aktiviert)
         self.ax2       = None
@@ -740,7 +749,7 @@ class AScope:
                                            linewidth=1.0, alpha=0.85,
                                            linestyle='--', label='log-compressed')
 
-        self._mode_confirmed = True   # False until user clicks in PPI after a mode change
+        self._mode_confirmed = False  # True erst nach erstem PPI-Klick
         self._zoom_xlim: Optional[tuple] = None   # (lo, hi) wenn gezoomt, sonst None
         self._pan_press_px:   Optional[float] = None   # Maus-X in Pixel beim Drücken
         self._pan_xlim_press: Optional[tuple] = None   # xlim beim Drücken
@@ -753,6 +762,7 @@ class AScope:
         self.fig.canvas.mpl_connect('button_press_event',   self._on_click)
         self.fig.canvas.mpl_connect('button_release_event', self._on_button_release)
         self.fig.canvas.mpl_connect('scroll_event',         self._on_scroll)
+        self._setup_buttons()
 
     # ── Style ─────────────────────────────────────────────────────────────────
 
@@ -788,7 +798,7 @@ class AScope:
     def _compress(self, data: np.ndarray) -> np.ndarray:
         """Soft-Log-Kompression: clip(0,255, 20 + 240·log₁₀(1 + P/P₀))"""
         with np.errstate(divide='ignore', invalid='ignore'):
-            out = 20.0 + 240.0 * np.log10(1.0 + data / self._p0)
+            out = 240.0 * np.log10(1.0 + data / self._p0)
         return np.clip(out, 0.0, 255.0)
 
     def _update_xlabel(self):
@@ -804,7 +814,7 @@ class AScope:
             rc = self.range_cell
             if self.ppi.cell_size_m > 0:
                 dist_m = rc * self.ppi.cell_size_m
-                detail = f'Range Cell {rc}  ({dist_m:,.0f} m / {dist_m/1852:.1f} nm)'
+                detail = f'Range Cell {rc}  ({dist_m:,.0f} m / {dist_m/1852:.1f} NM)'
             else:
                 detail = f'Range Cell {rc}'
         mode_lbl = 'Amp vs. Range' if self.mode == 'range' else 'Amp vs. Angle'
@@ -836,9 +846,11 @@ class AScope:
             return
         x = np.arange(n)
         self._line.set_data(x, cells)
+        self._line.set_visible(self._show_linear)
         if self._fill is not None:
             self._fill.remove()
-        self._fill = self.ax.fill_between(x, 0, cells, color=self.GREEN, alpha=0.18)
+        self._fill = self.ax.fill_between(x, 0, cells, color=self.GREEN,
+                                          alpha=0.18 if self._show_linear else 0.0)
         vmax = cells.max() if cells.max() > 0 else 1.0
         self.ax.set_xlim(0, n)
         self.ax.set_ylim(0, 255.0)
@@ -846,10 +858,11 @@ class AScope:
             self._estimate_p0()
             lc = self._compress(cells) / 255.0
             self._line_lc.set_data(x, lc)
+            self._line_lc.set_visible(self._show_log)
             if self._fill_lc is not None:
                 self._fill_lc.remove()
-            self._fill_lc = self.ax2.fill_between(x, 0, lc,
-                                                   color=self.LC_COLOR, alpha=0.10)
+            self._fill_lc = self.ax2.fill_between(x, 0, lc, color=self.LC_COLOR,
+                                                   alpha=0.10 if self._show_log else 0.0)
         if self._zoom_xlim is not None:
             self._apply_zoom(cells, np.arange(n, dtype=float))
         self._update_title()
@@ -869,9 +882,11 @@ class AScope:
             return
         x = np.linspace(0.0, 360.0, n, endpoint=False)
         self._line.set_data(x, ring)
+        self._line.set_visible(self._show_linear)
         if self._fill is not None:
             self._fill.remove()
-        self._fill = self.ax.fill_between(x, 0, ring, color=self.GREEN, alpha=0.18)
+        self._fill = self.ax.fill_between(x, 0, ring, color=self.GREEN,
+                                          alpha=0.18 if self._show_linear else 0.0)
         vmax = ring.max() if ring.max() > 0 else 1.0
         self.ax.set_xlim(0, 360)
         self.ax.set_ylim(0, 255.0)
@@ -879,10 +894,11 @@ class AScope:
             self._estimate_p0()
             lc = self._compress(ring) / 255.0
             self._line_lc.set_data(x, lc)
+            self._line_lc.set_visible(self._show_log)
             if self._fill_lc is not None:
                 self._fill_lc.remove()
-            self._fill_lc = self.ax2.fill_between(x, 0, lc,
-                                                   color=self.LC_COLOR, alpha=0.10)
+            self._fill_lc = self.ax2.fill_between(x, 0, lc, color=self.LC_COLOR,
+                                                   alpha=0.10 if self._show_log else 0.0)
         x_arr = np.linspace(0.0, 360.0, n, endpoint=False)
         if self._zoom_xlim is not None:
             self._apply_zoom(ring, x_arr)
@@ -985,6 +1001,113 @@ class AScope:
                 vmax = float(data[mask].max()) if data[mask].max() > 0 else 1.0
                 self.ax.set_ylim(0, min(vmax * 1.15, 255.0))
 
+    # ── Buttons ───────────────────────────────────────────────────────────────
+
+    def _setup_buttons(self):
+        from matplotlib.widgets import Button
+        BG_BTN = '#1a1a1a'
+        BG_HOV = '#1a3a1a'
+        btn_h  = 0.06
+        btn_y  = 0.02
+        gap    = 0.01
+        x0     = 0.07
+        x1     = 0.77
+        labels = ['Lin', 'Log', '-', '+', '<', '>'] if self._log_compress else ['-', '+', '<', '>']
+        n      = len(labels)
+        btn_w  = (x1 - x0 - (n - 1) * gap) / n
+        self._btns: dict = {}
+        for i, lbl in enumerate(labels):
+            ax_b = self.fig.add_axes([x0 + i * (btn_w + gap), btn_y, btn_w, btn_h])
+            b = Button(ax_b, lbl, color=BG_BTN, hovercolor=BG_HOV)
+            b.label.set_color(self.GREEN)
+            b.label.set_fontsize(9)
+            self._btns[lbl] = b
+        if self._log_compress:
+            self._btns['Lin'].on_clicked(lambda e: self._toggle_linear())
+            self._btns['Log'].on_clicked(lambda e: self._toggle_log())
+        self._btns['-'].on_clicked(lambda e: self._zoom_step(1.0 / 0.6))
+        self._btns['+'].on_clicked(lambda e: self._zoom_step(0.6))
+        self._btns['<'].on_clicked(lambda e: self._pan_step(-1))
+        self._btns['>'].on_clicked(lambda e: self._pan_step(+1))
+        self._update_btn_colors()
+        self._info_text.set_text(self._cursor_placeholder())
+        self._wm_text.set_text(self._fwhm_placeholder())
+
+    def _toggle_linear(self):
+        self._show_linear = not self._show_linear
+        self._update_btn_colors()
+        self.render()
+
+    def _toggle_log(self):
+        self._show_log = not self._show_log
+        self._update_btn_colors()
+        self.render()
+
+    def _update_btn_colors(self):
+        if not self._log_compress:
+            return
+        active_c   = self.GREEN
+        inactive_c = '#336633'
+        self._btns['Lin'].label.set_color(active_c if self._show_linear else inactive_c)
+        self._btns['Log'].label.set_color(active_c if self._show_log    else inactive_c)
+        self.fig.canvas.draw_idle()
+
+    def _cursor_placeholder(self) -> str:
+        r = self._row
+        rows = [self.CURSOR_HDR,
+                r('Az:',   '--°'),
+                r('Cell:', '--'),
+                r('Dist:', '-- m'),
+                r('',      '-- NM'),
+                r('Amp:',  '--'),
+                r('Rel:',  '--%')]
+        if self._log_compress:
+            rows.append(r('LC:', '--'))
+        return '\n'.join(rows)
+
+    def _fwhm_placeholder(self) -> str:
+        r = self._row
+        rows = [self.FWHM_HDR]
+        if self.mode == 'range':
+            rows += [r('cells:',  '--'),
+                     r('Width:', '-- m'),
+                     r('',        '-- NM')]
+        else:
+            rows += [r('Beamwidth:', '--°'),
+                     r('Az count:',  '--'),
+                     r('Width:', '-- NM')]
+        rows += [r('peak:', '--'),
+                 r('-6dB:', '--')]
+        return '\n'.join(rows)
+
+    def _zoom_step(self, factor: float):
+        xlo, xhi = self.ax.get_xlim()
+        center = (xlo + xhi) / 2.0
+        x_max  = 360.0 if self.mode == 'azimuth' else float(
+            len(self.ppi.get_spoke(self.azimuth)[0]) or 1)
+        new_lo = max(0.0, center - (center - xlo) * factor)
+        new_hi = min(x_max, center + (xhi - center) * factor)
+        if new_hi - new_lo < 2:
+            return
+        self._zoom_xlim = (new_lo, new_hi)
+        self.render()
+
+    def _pan_step(self, direction: int):
+        xlo, xhi = self.ax.get_xlim()
+        span  = xhi - xlo
+        shift = span * 0.15 * direction
+        x_max = 360.0 if self.mode == 'azimuth' else float(
+            len(self.ppi.get_spoke(self.azimuth)[0]) or 1)
+        new_lo = max(0.0, xlo + shift)
+        new_hi = min(x_max, xhi + shift)
+        if new_lo == 0.0:
+            new_hi = min(x_max, span)
+        if new_hi == x_max:
+            new_lo = max(0.0, x_max - span)
+        self._zoom_xlim = (new_lo, new_hi)
+        self.ax.set_xlim(new_lo, new_hi)
+        self.fig.canvas.draw_idle()
+
     # ── Interaction ───────────────────────────────────────────────────────────
 
     def _on_mouse_move(self, event):
@@ -1028,7 +1151,7 @@ class AScope:
     def _on_axes_leave(self, event):
         self._cursor_x = None
         self._vline.set_visible(False)
-        self._info_text.set_text('')
+        self._info_text.set_text(self._cursor_placeholder())
         if self._cursor_change_cb:
             self._cursor_change_cb(None)
         self.fig.canvas.draw_idle()
@@ -1150,37 +1273,28 @@ class AScope:
 
         width = x_right - x_left
 
-        # Build label (multi-line for readability)
+        # Build label (label links, Zahl rechts, gleiche Spaltenbreite wie Cursor-Readout)
+        r = self._row
+        rows = [self.FWHM_HDR]
         if self.mode == 'range':
+            rows.append(r('cells:', f'{width:.1f}'))
             if self.ppi.cell_size_m > 0:
                 w_m  = width * self.ppi.cell_size_m
                 w_nm = w_m / 1852.0
-                label = (f'── FWHM ──────────────────\n'
-                         f'  {width:.1f} cells\n'
-                         f'  {w_m:>10,.0f} m\n'
-                         f'  {w_nm:>10.3f} nm\n'
-                         f'  peak={peak_amp:.0f}  @-6dB={threshold:.0f}')
-            else:
-                label = (f'── FWHM ──────────────────\n'
-                         f'  {width:.1f} cells\n'
-                         f'  peak={peak_amp:.0f}  @-6dB={threshold:.0f}')
+                rows += [r('Width:', f'{w_m:.0f} m'),
+                         r('',        f'{w_nm:.2f} NM')]
         else:
             az_count = round(width / 360.0 * self.ppi.az_bins)
+            rows += [r('Beamwidth:', f'{width:.3f}°'),
+                     r('Az count:',  str(az_count))]
             if self.ppi.cell_size_m > 0:
-                range_m  = self.range_cell * self.ppi.cell_size_m
-                arc_m    = 2 * np.pi * range_m * (width / 360.0)
-                arc_nm   = arc_m / 1852.0
-                label = (f'── FWHM ──────────────────\n'
-                         f'  {width:.3f}°\n'
-                         f'  {az_count} azimuths\n'
-                         f'  arc  {arc_m:>8,.0f} m\n'
-                         f'       {arc_nm:>8.3f} nm\n'
-                         f'  peak={peak_amp:.0f}  @-6dB={threshold:.0f}')
-            else:
-                label = (f'── FWHM ──────────────────\n'
-                         f'  {width:.3f}°\n'
-                         f'  {az_count} azimuths\n'
-                         f'  peak={peak_amp:.0f}  @-6dB={threshold:.0f}')
+                range_m = self.range_cell * self.ppi.cell_size_m
+                arc_m   = 2 * np.pi * range_m * (width / 360.0)
+                arc_nm  = arc_m / 1852.0
+                rows += [r('Width:', f'{arc_nm:.2f} NM')]
+        rows += [r('peak:', f'{peak_amp:.0f}'),
+                 r('-6dB:', f'{threshold:.0f}')]
+        label = '\n'.join(rows)
 
         # Draw overlays
         self._clear_width_measure()
@@ -1195,17 +1309,7 @@ class AScope:
         self._wm_fill = self.ax.fill_between(
             x_arr, threshold, data, where=mask,
             color=self.WM, alpha=0.18)
-        # Box in die dem Peak gegenüberliegende Ecke stellen
-        xlo, xhi = self.ax.get_xlim()
-        peak_axes_x = (float(x_arr[peak_idx]) - xlo) / (xhi - xlo) if xhi > xlo else 0.5
-        if peak_axes_x < 0.5:
-            self._wm_text.set_position((0.99, 0.97))
-            self._wm_text.set_ha('right')
-        else:
-            self._wm_text.set_position((0.01, 0.97))
-            self._wm_text.set_ha('left')
         self._wm_text.set_text(label)
-        self._wm_text.get_bbox_patch().set_alpha(0.85)
 
     def _clear_width_measure(self):
         """Removes all width measurement overlays."""
@@ -1217,8 +1321,7 @@ class AScope:
                 except Exception:
                     pass
                 setattr(self, attr, None)
-        self._wm_text.set_text('')
-        self._wm_text.get_bbox_patch().set_alpha(0.0)
+        self._wm_text.set_text(self._fwhm_placeholder())
 
     def _update_az_selection(self):
         """Fills the area between start and end and shows count values."""
@@ -1268,31 +1371,59 @@ class AScope:
     def _refresh_cursor(self, x: float, data: np.ndarray, x_max: float):
         if x is None:
             return
+        r = self._row
         n = len(data)
+
+        # Werte bestimmen — feste Größen je nach Modus immer bekannt
         if self.mode == 'range':
-            idx = int(round(x))
-            label = f'Cell  : {idx}'
+            idx      = int(round(x))
+            az_str   = f'{self.azimuth:.1f}°'
+            cell_str = str(idx) if 0 <= idx < n else '--'
+            if 0 <= idx < n and self.ppi.cell_size_m > 0:
+                dm = idx * self.ppi.cell_size_m
+                dist_m_str  = f'{dm:.0f} m'
+                dist_nm_str = f'{dm / 1852.0:.2f} NM'
+            else:
+                dist_m_str  = '-- m'
+                dist_nm_str = '-- NM'
         else:
-            # x is angle in degrees → compute index
-            idx = int(round(x / 360.0 * n)) % n
-            label = f'Az    : {x:.1f}°'
+            idx      = int(round(x / 360.0 * n)) % n if n > 0 else -1
+            az_str   = f'{x:.1f}°'
+            rc       = self.range_cell
+            cell_str = str(rc)
+            if self.ppi.cell_size_m > 0:
+                dm = rc * self.ppi.cell_size_m
+                dist_m_str  = f'{dm:.0f} m'
+                dist_nm_str = f'{dm / 1852.0:.2f} NM'
+            else:
+                dist_m_str  = '-- m'
+                dist_nm_str = '-- NM'
 
         if 0 <= idx < n:
             amp  = data[idx]
             vmax = data.max() if data.max() > 0 else 1.0
+            amp_str = f'{amp:.1f}'
+            rel_str = f'{amp / vmax * 100.0:.1f}%'
+            lc_str  = (f'{float(self._compress(np.array([amp]))[0]) / 255.0:.3f}'
+                       if self._log_compress else None)
             self._vline.set_xdata([x, x])
             self._vline.set_visible(True)
-            lc_line = (f'\nLC    : {float(self._compress(np.array([amp]))[0]) / 255.0:.3f}'
-                       if self._log_compress else '')
-            self._info_text.set_text(
-                f'{label}\n'
-                f'Amp   : {amp:.1f}\n'
-                f'Rel   : {amp / vmax * 100.0:.1f}%'
-                f'{lc_line}'
-            )
         else:
+            amp_str = '--'
+            rel_str = '--%'
+            lc_str  = '--' if self._log_compress else None
             self._vline.set_visible(False)
-            self._info_text.set_text('')
+
+        rows = [self.CURSOR_HDR,
+                r('Az:',   az_str),
+                r('Cell:', cell_str),
+                r('Dist:', dist_m_str),
+                r('',      dist_nm_str),
+                r('Amp:',  amp_str),
+                r('Rel:',  rel_str)]
+        if lc_str is not None:
+            rows.append(r('LC:', lc_str))
+        self._info_text.set_text('\n'.join(rows))
 
     # ── Public control ────────────────────────────────────────────────────────
 
@@ -1317,6 +1448,7 @@ class AScope:
         self._clear_width_measure()
         self._mode_confirmed = False
         self.mode = mode
+        self._info_text.set_text(self._cursor_placeholder())
         if self._mode_change_cb:
             self._mode_change_cb(mode)
         self._update_xlabel()
@@ -1398,35 +1530,54 @@ def _is_multicast(ip: str) -> bool:
 
 def scan_pcap_streams(filepath: str) -> dict:
     """
-    Fast scan of a PCAP/PCAPNG file without ASTERIX decoding.
-    Returns {(dst_ip, dst_port): packet_count} sorted descending.
+    Fast scan of a PCAP/PCAPNG file without full ASTERIX decoding.
+    Returns {(dst_ip, dst_port): (total_packets, cat240_packets)} sorted
+    descending by total packet count.
+    CAT240 packets are identified by first payload byte == 0xF0.
     """
     reader  = PcapReader(filepath)
     streams: dict = {}
-    for _ts, _udp, dst_ip, dst_port in reader.packets():
+    for _ts, udp, dst_ip, dst_port in reader.packets():
         key = (dst_ip, dst_port)
-        streams[key] = streams.get(key, 0) + 1
-    return dict(sorted(streams.items(), key=lambda x: -x[1]))
+        total, cat240 = streams.get(key, (0, 0))
+        is_cat240 = len(udp) > 0 and udp[0] == 0xF0
+        streams[key] = (total + 1, cat240 + (1 if is_cat240 else 0))
+    return dict(sorted(streams.items(), key=lambda x: -x[1][0]))
 
 
 def _prompt_stream_selection(streams: dict):
     """
     Shows detected UDP streams and prompts for selection via terminal.
+    streams: {(dst_ip, dst_port): (total_packets, cat240_packets)}
+    Pre-filters to CAT240 streams; falls back to all streams if none found.
     Returns (dst_ip, dst_port) or None if streams dict is empty.
     """
     if not streams:
         return None
-    keys = list(streams.keys())
+
+    # Vorfiltern auf CAT240-Streams
+    cat240 = {k: v for k, v in streams.items() if v[1] > 0}
+    if cat240:
+        candidates = cat240
+        label = 'CAT240 streams'
+    else:
+        candidates = streams
+        label = 'UDP streams (no CAT240 detected)'
+
+    keys = list(candidates.keys())
     if len(keys) == 1:
         ip, port = keys[0]
+        total, n240 = candidates[keys[0]]
         mc = ' (Multicast)' if _is_multicast(ip) else ''
-        print(f"\n  Single stream: {ip}:{port}{mc}  –  {streams[keys[0]]} packets")
+        print(f"\n  Single {label}: {ip}:{port}{mc}  –  {total} packets  ({n240} CAT240)")
         return keys[0]
 
-    print(f"\n  Available UDP streams:")
+    print(f"\n  Available {label}:")
     for i, (ip, port) in enumerate(keys, 1):
+        total, n240 = candidates[(ip, port)]
         mc = ' (Multicast)' if _is_multicast(ip) else ''
-        print(f"    [{i}]  {ip}:{port}{mc}  –  {streams[(ip, port)]} packets")
+        cat_hint = f'  ({n240} CAT240)' if n240 > 0 else ''
+        print(f"    [{i}]  {ip}:{port}{mc}  –  {total} packets{cat_hint}")
 
     while True:
         try:
@@ -1632,6 +1783,8 @@ def _setup_ppi_buttons(fig_ppi, ax_ppi, ppi, ascope_ref: list,
     _HOV = '#1a2a1a'
     _ACT = '#0a3a0a'
 
+    BTN_Y = 0.01
+    BTN_H = 0.045
     fig_ppi.subplots_adjust(left=0.01, right=0.99, top=0.97, bottom=0.065)
 
     def _btn(rect, label):
@@ -1642,10 +1795,31 @@ def _setup_ppi_buttons(fig_ppi, ax_ppi, ppi, ascope_ref: list,
         b.label.set_fontfamily('monospace')
         return b
 
-    btn_pause  = _btn([0.01, 0.01, 0.08, 0.045], 'Pause')
-    btn_zoom   = _btn([0.10, 0.01, 0.07, 0.045], 'Zoom')
-    btn_ascope = _btn([0.18, 0.01, 0.12, 0.045], '[ ] A-Scope')
-    btn_shot   = _btn([0.31, 0.01, 0.13, 0.045], 'Screenshot')
+    btn_pause  = _btn([0.01, BTN_Y, 0.08, BTN_H], 'Pause')
+    btn_zoom   = _btn([0.10, BTN_Y, 0.07, BTN_H], 'Zoom')
+    btn_ascope = _btn([0.18, BTN_Y, 0.12, BTN_H], '[ ] A-Scope')
+    btn_mode   = _btn([0.31, BTN_Y, 0.09, BTN_H], 'Rng')
+
+    # Mode-Button initial dimmen (kein A-Scope offen)
+    _DIM_FG = '#336633'
+    btn_mode.label.set_color(_DIM_FG)
+
+    def _mode_label(mode: str) -> str:
+        return 'Rng' if mode == 'range' else 'Az'
+
+    def on_mode(_):
+        asc = ascope_ref[0]
+        if asc is None:
+            return
+        new_mode = 'azimuth' if asc.mode == 'range' else 'range'
+        asc.set_mode(new_mode)
+        btn_mode.label.set_text(_mode_label(new_mode))
+        fig_ppi.canvas.draw_idle()
+    btn_mode.on_clicked(on_mode)
+
+    def sync_mode_btn(mode: str):
+        btn_mode.label.set_text(_mode_label(mode))
+        fig_ppi.canvas.draw_idle()
 
     # ── Zoom-State ────────────────────────────────────────────────────────────
     zoom_active = [False]
@@ -1768,34 +1942,24 @@ def _setup_ppi_buttons(fig_ppi, ax_ppi, ppi, ascope_ref: list,
         is_open = ascope_ref[0] is not None
         ascope_on[0] = is_open
         btn_ascope.label.set_text('[A] A-Scope' if is_open else '[ ] A-Scope')
+        if is_open and ascope_ref[0] is not None:
+            btn_mode.label.set_color(_FG)
+            btn_mode.label.set_text(_mode_label(ascope_ref[0].mode))
+        else:
+            btn_mode.label.set_color(_DIM_FG)
         fig_ppi.canvas.draw_idle()
     btn_ascope.on_clicked(on_ascope)
-
-    # ── Screenshot ────────────────────────────────────────────────────────────
-    def on_screenshot(_):
-        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-        p_ppi = f'cat240_ppi_{ts}.png'
-        fig_ppi.savefig(p_ppi, dpi=150, bbox_inches='tight',
-                        facecolor=fig_ppi.get_facecolor())
-        print(f"  Screenshot: {p_ppi}")
-        asc = ascope_ref[0]
-        if ascope_on[0] and asc is not None:
-            try:
-                p_asc = f'cat240_ascope_{ts}.png'
-                asc.fig.savefig(p_asc, dpi=150, bbox_inches='tight',
-                                facecolor=asc.fig.get_facecolor())
-                print(f"  Screenshot: {p_asc}")
-            except Exception:
-                pass
-    btn_shot.on_clicked(on_screenshot)
 
     def sync_ascope_btn(is_open: bool):
         """Synchronisiert den A-Scope-Button-State (z.B. bei X-Schliessen)."""
         ascope_on[0] = is_open
         btn_ascope.label.set_text('[A] A-Scope' if is_open else '[ ] A-Scope')
+        if not is_open:
+            btn_mode.label.set_color(_DIM_FG)
         fig_ppi.canvas.draw_idle()
 
-    return {'sync_ascope': sync_ascope_btn, 'zoom_active': zoom_active}
+    return {'sync_ascope': sync_ascope_btn, 'sync_mode': sync_mode_btn,
+            'zoom_active': zoom_active}
 
 
 def _attach_ppi_scroll_zoom(fig_ppi, ax_ppi, ppi):
@@ -1835,12 +1999,14 @@ def _toggle_ascope_mode(fig_ppi, ascope: 'AScope'):
     ascope.set_mode(new_mode)
 
 
-def _setup_ppi_overlay(ascope: 'AScope', az_line, range_ring, ppi_tick, ppi_obj, fig_ppi):
+def _setup_ppi_overlay(ascope: 'AScope', az_line, range_ring, ppi_tick, ppi_obj, fig_ppi,
+                       on_mode_extra=None):
     """
     Registers mode and cursor callbacks for PPI overlays:
     - az_line:    Azimuth line (range mode)
     - range_ring: Range ring (azimuth mode)
     - ppi_tick:   Small crosshair at the A-Scope cursor position in the PPI
+    - on_mode_extra: optional fn(mode) called after mode change (e.g. to sync PPI button)
     """
     tick_len = ppi_obj.max_range_cells * 0.03   # crosshair length in PPI units
 
@@ -1851,6 +2017,8 @@ def _setup_ppi_overlay(ascope: 'AScope', az_line, range_ring, ppi_tick, ppi_obj,
         else:
             az_line.set_visible(False)
         ppi_tick.set_data([], [])
+        if on_mode_extra:
+            on_mode_extra(mode)
         fig_ppi.canvas.draw_idle()
 
     def on_cursor_change(cursor_x):
@@ -1881,24 +2049,41 @@ def _setup_ppi_overlay(ascope: 'AScope', az_line, range_ring, ppi_tick, ppi_obj,
 
 
 def _attach_ppi_readout(fig, ax, ppi):
-    """Adds cursor readout (bearing + distance) in the button row (right side)."""
-    txt = fig.text(0.54, 0.0325, 'Bearing: —   Dist: —',
-                   ha='left', va='center', color='#00ff41',
-                   fontsize=9, fontfamily='monospace',
-                   transform=fig.transFigure)
+    """Cursor readout (bearing + distance) as overlay in the top-left of the PPI axes."""
+    COLOR = '#ffcc00'
+
+    def _row(lbl: str, val: str) -> str:
+        return f'{lbl:<6}{val:>9}'
+
+    def _placeholder() -> str:
+        return '\n'.join([_row('Az:', '--°'),
+                          _row('Dist:', '-- NM'),
+                          _row('',      '-- m')])
+
+    txt = ax.text(
+        0.01, 0.99, _placeholder(),
+        transform=ax.transAxes, ha='left', va='top',
+        color=COLOR, fontsize=9, fontfamily='monospace',
+        bbox=dict(boxstyle='round,pad=0.3', facecolor='#1a1a00',
+                  edgecolor=COLOR, alpha=0.85))
 
     def on_move(event):
         if event.inaxes is not ax or event.xdata is None:
-            txt.set_text('Bearing: —   Dist: —')
+            txt.set_text(_placeholder())
             fig.canvas.draw_idle()
             return
         az = np.degrees(np.arctan2(event.xdata, event.ydata)) % 360.0
         r  = np.sqrt(event.xdata**2 + event.ydata**2)
         if ppi.cell_size_m > 0:
-            dist_nm = r * ppi.cell_size_m / 1852.0
-            txt.set_text(f'Bearing: {az:6.1f}°   {dist_nm:.1f} nm')
+            dist_m  = r * ppi.cell_size_m
+            dist_nm = dist_m / 1852.0
+            lines = [_row('Az:',   f'{az:.1f}°'),
+                     _row('Dist:', f'{dist_nm:.2f} NM'),
+                     _row('',      f'{dist_m:.0f} m')]
         else:
-            txt.set_text(f'Bearing: {az:6.1f}°   {r:.0f} cells')
+            lines = [_row('Az:',   f'{az:.1f}°'),
+                     _row('Dist:', f'{r:.0f} cells')]
+        txt.set_text('\n'.join(lines))
         fig.canvas.draw_idle()
 
     fig.canvas.mpl_connect('motion_notify_event', on_move)
@@ -2031,7 +2216,8 @@ def analyze_pcap(filepath: str, display: bool = True,
                             t.start()
                         a.fig.canvas.mpl_connect('close_event', _on_x_close)
                     ascope_ref[0] = ascope_instance[0]
-                    _setup_ppi_overlay(ascope_ref[0], az_line, range_ring, ppi_tick, ppi, fig_ppi)
+                    _setup_ppi_overlay(ascope_ref[0], az_line, range_ring, ppi_tick, ppi, fig_ppi,
+                                       on_mode_extra=ppi_btns.get('sync_mode'))
                     ascope_ref[0].render()
                     _ascope_show(ascope_ref[0].fig)
 
@@ -2167,11 +2353,10 @@ def replay_pcap(filepath: str, speed: float = 1.0,
     fig_ppi, ax_ppi = plt.subplots(figsize=(10, 10), facecolor='#0a0a0a',
                                     num='PPI  |  CAT240 Replay')
     fig_ppi.canvas.manager.set_window_title('PPI  |  CAT240 Replay')
-    _attach_ppi_readout(fig_ppi, ax_ppi, ppi)
-
     # Initial render – creates mesh and calls ax.clear() ONCE.
     # All overlays must be added to the axis AFTERWARDS.
     ppi.render(ax_ppi, title=f"CAT240 Replay  |  {speed}x")
+    _attach_ppi_readout(fig_ppi, ax_ppi, ppi)
 
     ascope_ref      = [None]
     ascope_instance = [None]
@@ -2214,7 +2399,8 @@ def replay_pcap(filepath: str, speed: float = 1.0,
                     t.start()
                 a.fig.canvas.mpl_connect('close_event', _on_x_close)
             ascope_ref[0] = ascope_instance[0]
-            _setup_ppi_overlay(ascope_ref[0], az_sel_line, range_ring, ppi_tick, ppi, fig_ppi)
+            _setup_ppi_overlay(ascope_ref[0], az_sel_line, range_ring, ppi_tick, ppi, fig_ppi,
+                               on_mode_extra=ppi_btns.get('sync_mode'))
             ascope_ref[0].render()
             _ascope_show(ascope_ref[0].fig)
 
@@ -2405,7 +2591,8 @@ def live_stream(host: str = '0.0.0.0', port: int = 5000,
                     t.start()
                 a.fig.canvas.mpl_connect('close_event', _on_x_close)
             ascope_ref[0] = ascope_instance[0]
-            _setup_ppi_overlay(ascope_ref[0], az_line, range_ring, ppi_tick, ppi, fig_ppi)
+            _setup_ppi_overlay(ascope_ref[0], az_line, range_ring, ppi_tick, ppi, fig_ppi,
+                               on_mode_extra=ppi_btns.get('sync_mode'))
             ascope_ref[0].render()
             _ascope_show(ascope_ref[0].fig)
 
