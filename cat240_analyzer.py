@@ -8,12 +8,6 @@ Dependencies:
     pip install matplotlib numpy
 
 Usage:
-    # Analyze a PCAP file, show PPI + A-Scope:
-    python cat240_analyzer.py --file aufzeichnung.pcap
-
-    # With fixed start azimuth for A-Scope (e.g. 90°):
-    python cat240_analyzer.py --file aufzeichnung.pcap --azimuth 90
-
     # Play back a PCAP file as animated radar (1× real-time):
     python cat240_analyzer.py --replay aufzeichnung.pcapng
 
@@ -26,16 +20,9 @@ Usage:
     # Live stream from UDP port:
     python cat240_analyzer.py --live --port 5000
 
-    # Analyze only, no window:
-    python cat240_analyzer.py --file aufzeichnung.pcap --no-display
-
-    # Save PPI as PNG:
-    python cat240_analyzer.py --file aufzeichnung.pcap --save ppi_output.png
-
 A-Scope controls:
     - Click in PPI   → A-Scope shows that azimuth
     - Mouse in A-Scope → vertical measurement line with cell no. & amplitude
-    - --azimuth N    → A-Scope starts at fixed angle N°
 """
 
 import argparse
@@ -320,7 +307,7 @@ class PcapReader:
         self._frag_buffer: dict = {}
 
     def packets(self):
-        """Generator: yields (timestamp, udp_payload_bytes) for each UDP packet."""
+        """Generator: yields (timestamp, udp_payload_bytes, src_ip, dst_ip, dst_port) for each UDP packet."""
         with open(self.filepath, 'rb') as f:
             magic = struct.unpack('<I', f.read(4))[0]
             f.seek(0)
@@ -349,7 +336,7 @@ class PcapReader:
             timestamp = ts_sec + ts_usec / 1e6
             result = self._extract_udp(raw, link_type)
             if result:
-                yield timestamp, result[0], result[1], result[2]
+                yield timestamp, result[0], result[1], result[2], result[3]
 
     def _read_pcapng(self, f):
         """Simplified PCAPNG reader (Section Header + Interface + Enhanced Packet)."""
@@ -382,10 +369,10 @@ class PcapReader:
                     pkt_data = block_body[20:20 + cap_len]
                     result = self._extract_udp(pkt_data, link_type)
                     if result:
-                        yield timestamp, result[0], result[1], result[2]
+                        yield timestamp, result[0], result[1], result[2], result[3]
 
-    def _extract_udp(self, raw: bytes, link_type: int) -> Optional[Tuple[bytes, str, int]]:
-        """Extracts UDP payload + destination IP + destination port from an Ethernet/IP packet.
+    def _extract_udp(self, raw: bytes, link_type: int) -> Optional[Tuple[bytes, str, str, int]]:
+        """Extracts UDP payload + source IP + destination IP + destination port from an Ethernet/IP packet.
         Supports IP fragment reassembly (e.g. SAT2 radar with 8 kB UDP datagrams)."""
         try:
             if link_type == 1:   # Ethernet
@@ -426,12 +413,12 @@ class PcapReader:
                     return None
                 dst_port = struct.unpack('>H', ip_payload[2:4])[0]
                 udp_len  = struct.unpack('>H', ip_payload[4:6])[0]
-                return ip_payload[8:udp_len], dst_ip, dst_port
+                return ip_payload[8:udp_len], src_ip, dst_ip, dst_port
 
             # ── IP-Fragmentierung ────────────────────────────────────────────
             key = (src_ip, dst_ip, protocol, ip_id)
             if key not in self._frag_buffer:
-                self._frag_buffer[key] = {'frags': {}, 'last_off': -1, 'dst_ip': dst_ip}
+                self._frag_buffer[key] = {'frags': {}, 'last_off': -1, 'src_ip': src_ip, 'dst_ip': dst_ip}
             entry = self._frag_buffer[key]
             entry['frags'][frag_off] = ip_payload
             if not mf:
@@ -456,7 +443,7 @@ class PcapReader:
                 return None
             dst_port = struct.unpack('>H', bytes(total[2:4]))[0]
             udp_len  = struct.unpack('>H', bytes(total[4:6]))[0]
-            return bytes(total[8:udp_len]), dst_ip, dst_port
+            return bytes(total[8:udp_len]), entry['src_ip'], dst_ip, dst_port
 
         except Exception:
             return None
@@ -496,6 +483,10 @@ class RadarPPI:
         # Range-Ring-Patches (werden bei cell_size-Änderung neu gezeichnet)
         self._range_ring_patches: list = []
         self._rings_drawn_for_cell_size: float = -1.0
+        # Dirty flag: gesetzt von add_message(), gelöscht nach grid.copy() in render()
+        self._dirty       = False
+        self._vmax_cached = 0.0
+        self._grid_render = np.zeros((az_bins, max_range_cells), dtype=np.float32)
 
     def add_message(self, msg: Cat240Message):
         """Inserts a CAT240 azimuth into the PPI grid."""
@@ -527,6 +518,7 @@ class RadarPPI:
                 n = r_end - r_start
             self.grid[az_idx, r_start:r_end] = cells[:n]
             self._msg_count += 1
+            self._dirty = True
             if self.cell_size_m == 0.0 and msg.cell_duration_ns > 0:
                 self.cell_size_m       = 299_792_458.0 * msg.cell_duration_ns * 1e-9 / 2.0
                 self._cell_duration_ns = msg.cell_duration_ns
@@ -537,11 +529,13 @@ class RadarPPI:
         import matplotlib.colors as mcolors
 
         with self._lock:
-            grid_copy = self.grid.copy()
+            if self._dirty:
+                np.copyto(self._grid_render, self.grid)
+                self._vmax_cached = float(self._grid_render.max())
+                self._dirty = False
             msg_count = self._msg_count
 
-        # Logarithmic normalisation (like a real radar)
-        vmax = grid_copy.max()
+        vmax = self._vmax_cached
         norm = mcolors.PowerNorm(gamma=0.5, vmin=0, vmax=vmax) if vmax > 0 else None
 
         if self._mesh is None or self._mesh_ax is not ax:
@@ -550,7 +544,7 @@ class RadarPPI:
             self._range_ring_patches = []
             self._rings_drawn_for_cell_size = -1.0
             ax.set_facecolor('black')
-            self._mesh = ax.pcolormesh(self._X, self._Y, grid_copy, cmap=colormap,
+            self._mesh = ax.pcolormesh(self._X, self._Y, self._grid_render, cmap=colormap,
                                        norm=norm, shading='nearest', rasterized=True)
             self._mesh_ax = ax
 
@@ -573,7 +567,7 @@ class RadarPPI:
                 sp.set_visible(False)
         else:
             # Subsequent update: only refresh image data and normalisation
-            self._mesh.set_array(grid_copy.ravel())
+            self._mesh.set_array(self._grid_render.ravel())
             if norm is not None:
                 self._mesh.set_norm(norm)
 
@@ -622,6 +616,8 @@ class RadarPPI:
         with self._lock:
             self.grid[:] = 0
             self._msg_count = 0
+            self._dirty = True
+            self._vmax_cached = 0.0
 
     def get_spoke(self, azimuth_deg: float) -> Tuple[np.ndarray, float]:
         """Returns the azimuth (amplitude values) for a given azimuth angle."""
@@ -1531,63 +1527,77 @@ def _is_multicast(ip: str) -> bool:
 def scan_pcap_streams(filepath: str) -> dict:
     """
     Fast scan of a PCAP/PCAPNG file without full ASTERIX decoding.
-    Returns {(dst_ip, dst_port): (total_packets, cat240_packets)} sorted
+    Returns {(dst_ip, dst_port): (total_packets, cat240_packets, src_ips)} sorted
     descending by total packet count.
     CAT240 packets are identified by first payload byte == 0xF0.
     """
     reader  = PcapReader(filepath)
     streams: dict = {}
-    for _ts, udp, dst_ip, dst_port in reader.packets():
+    for _ts, udp, src_ip, dst_ip, dst_port in reader.packets():
         key = (dst_ip, dst_port)
-        total, cat240 = streams.get(key, (0, 0))
+        total, cat240, src_ips = streams.get(key, (0, 0, set()))
         is_cat240 = len(udp) > 0 and udp[0] == 0xF0
-        streams[key] = (total + 1, cat240 + (1 if is_cat240 else 0))
+        src_ips = src_ips | {src_ip}
+        streams[key] = (total + 1, cat240 + (1 if is_cat240 else 0), src_ips)
     return dict(sorted(streams.items(), key=lambda x: -x[1][0]))
 
 
-def _prompt_stream_selection(streams: dict):
+def _prompt_stream_selection(streams: dict, no_filter: bool = False):
     """
     Shows detected UDP streams and prompts for selection via terminal.
     streams: {(dst_ip, dst_port): (total_packets, cat240_packets)}
-    Pre-filters to CAT240 streams; falls back to all streams if none found.
+    Pre-filters to CAT240 streams unless no_filter=True; falls back to all streams if none found.
     Returns (dst_ip, dst_port) or None if streams dict is empty.
     """
     if not streams:
         return None
 
-    # Vorfiltern auf CAT240-Streams
-    cat240 = {k: v for k, v in streams.items() if v[1] > 0}
-    if cat240:
-        candidates = cat240
-        label = 'CAT240 streams'
-    else:
+    if no_filter:
         candidates = streams
-        label = 'UDP streams (no CAT240 detected)'
+        label = 'UDP streams (unfiltered)'
+    else:
+        # Vorfiltern auf CAT240-Streams
+        cat240 = {k: v for k, v in streams.items() if v[1] > 0}
+        if cat240:
+            candidates = cat240
+            label = 'CAT240 streams'
+        else:
+            candidates = streams
+            label = 'UDP streams (no CAT240 detected)'
 
     keys = list(candidates.keys())
     if len(keys) == 1:
         ip, port = keys[0]
-        total, n240 = candidates[keys[0]]
+        total, n240, src_ips = candidates[keys[0]]
         mc = ' (Multicast)' if _is_multicast(ip) else ''
-        print(f"\n  Single {label}: {ip}:{port}{mc}  –  {total} packets  ({n240} CAT240)")
+        src_str = f'  src: {", ".join(sorted(src_ips))}' if src_ips else ''
+        print(f"\n  Single {label}: {ip}:{port}{mc}{src_str}  –  {total} packets  ({n240} CAT240)")
         return keys[0]
 
     print(f"\n  Available {label}:")
     for i, (ip, port) in enumerate(keys, 1):
-        total, n240 = candidates[(ip, port)]
+        total, n240, src_ips = candidates[(ip, port)]
         mc = ' (Multicast)' if _is_multicast(ip) else ''
+        src_str = f'  src: {", ".join(sorted(src_ips))}' if src_ips else ''
         cat_hint = f'  ({n240} CAT240)' if n240 > 0 else ''
-        print(f"    [{i}]  {ip}:{port}{mc}  –  {total} packets{cat_hint}")
+        print(f"    [{i}]  {ip}:{port}{mc}{src_str}  –  {total} packets{cat_hint}")
+    print(f"    [0]  Abort")
 
     while True:
         try:
-            choice = input(f"\n  Select stream [1–{len(keys)}]: ").strip()
-            idx = int(choice) - 1
-            if 0 <= idx < len(keys):
-                return keys[idx]
-        except (ValueError, EOFError, KeyboardInterrupt):
-            pass
-        print(f"  Please enter a number between 1 and {len(keys)}.")
+            choice = input(f"\n  Select stream [1–{len(keys)}, 0=abort]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        try:
+            idx = int(choice)
+        except ValueError:
+            print(f"  Please enter a number between 1 and {len(keys)}, or 0 to abort.")
+            continue
+        if idx == 0:
+            return None
+        if 1 <= idx <= len(keys):
+            return keys[idx - 1]
+        print(f"  Please enter a number between 1 and {len(keys)}, or 0 to abort.")
 
 
 def _prompt_live_config(default_host: str = '0.0.0.0',
@@ -2067,13 +2077,21 @@ def _attach_ppi_readout(fig, ax, ppi):
         bbox=dict(boxstyle='round,pad=0.3', facecolor='#1a1a00',
                   edgecolor=COLOR, alpha=0.85))
 
+    _last_pos = [None]   # (az, r) des letzten Redraws
+
     def on_move(event):
         if event.inaxes is not ax or event.xdata is None:
-            txt.set_text(_placeholder())
-            fig.canvas.draw_idle()
+            if _last_pos[0] is not None:
+                _last_pos[0] = None
+                txt.set_text(_placeholder())
+                fig.canvas.draw_idle()
             return
         az = np.degrees(np.arctan2(event.xdata, event.ydata)) % 360.0
         r  = np.sqrt(event.xdata**2 + event.ydata**2)
+        last = _last_pos[0]
+        if last is not None and abs(az - last[0]) < 0.2 and abs(r - last[1]) < 0.5:
+            return
+        _last_pos[0] = (az, r)
         if ppi.cell_size_m > 0:
             dist_m  = r * ppi.cell_size_m
             dist_nm = dist_m / 1852.0
@@ -2089,200 +2107,21 @@ def _attach_ppi_readout(fig, ax, ppi):
     fig.canvas.mpl_connect('motion_notify_event', on_move)
 
 
-def analyze_pcap(filepath: str, display: bool = True,
-                 save_path: Optional[str] = None,
-                 verbose: bool = True,
-                 initial_azimuth: float = 0.0,
-                 filter_stream: Optional[Tuple[str, int]] = None,
-                 log_compress: bool = False) -> List[Cat240Message]:
-    """
-    Reads a PCAP file, decodes all CAT240 packets and
-    optionally displays PPI + A-Scope.
-    Click in PPI → A-Scope updates to that azimuth.
-    filter_stream: (dst_ip, dst_port) or None → determined via scan + selection.
-    """
-    import matplotlib.pyplot as plt
-
-    print(f"\n{'='*60}")
-    print(f"  CAT240 Analyzer  |  {filepath}")
-    print(f"{'='*60}")
-
-    # ── Stream selection ──────────────────────────────────────────────────────
-    if filter_stream is None:
-        print("  Scanning streams ...")
-        all_streams = scan_pcap_streams(filepath)
-        filter_stream = _prompt_stream_selection(all_streams)
-
-    sel_ip, sel_port = filter_stream
-    mc = ' (Multicast)' if _is_multicast(sel_ip) else ''
-    print(f"  Selected stream:     {sel_ip}:{sel_port}{mc}")
-    print(f"{'='*60}")
-
-    reader  = PcapReader(filepath)
-    decoder = Cat240Decoder()
-    ppi     = RadarPPI(max_range_cells=1024, az_bins=4096)
-
-    messages = []
-    pkt_count = 0
-    cat240_count = 0
-    errors = 0
-    max_cells = 0
-
-    for _ts, udp_payload, dst_ip, dst_port in reader.packets():
-        pkt_count += 1
-        if (dst_ip, dst_port) != filter_stream:
-            continue
-        try:
-            decoded = decoder.decode_multiple(udp_payload)
-            for msg in decoded:
-                messages.append(msg)
-                ppi.add_message(msg)
-                cat240_count += 1
-                max_cells = max(max_cells, len(msg.video_data))
-                if verbose and cat240_count % 500 == 0:
-                    print(f"  {cat240_count:6d} CAT240 messages decoded ...", end='\r')
-        except Exception:
-            errors += 1
-
-    compressed_count = sum(1 for m in messages if m.compression)
-    print(f"\n  Total packets:       {pkt_count}")
-    print(f"  CAT240 messages:     {cat240_count}")
-    print(f"  Errors:              {errors}")
-    print(f"  Max. cells/azimuth:    {max_cells}")
-    if compressed_count:
-        print(f"  *** WARNING: {compressed_count} messages have log compression flag set ***")
-        print(f"  *** Amplitude values are logarithmically encoded, not linear!        ***")
-    else:
-        print(f"  Compression:         none (linear amplitude)")
-
-    if messages:
-        az_values = [m.start_azimuth_deg for m in messages]
-        print(f"  Azimuth range:       {min(az_values):.1f}° – {max(az_values):.1f}°")
-        print(f"{'='*60}\n")
-
-    if display or save_path:
-        # ── PPI window ────────────────────────────────────────────────────────
-        plt.rcParams['toolbar'] = 'None'
-        fig_ppi, ax_ppi = plt.subplots(figsize=(10, 10), facecolor='#0a0a0a',
-                                        num='PPI  |  CAT240')
-        fig_ppi.canvas.manager.set_window_title('PPI  |  CAT240')
-        ppi.render(ax_ppi, title=f"CAT240 PPI  –  {filepath}")
-        _attach_ppi_readout(fig_ppi, ax_ppi, ppi)
-
-        # Azimuth line and range ring in PPI
-        az_rad0 = np.deg2rad(initial_azimuth)
-        az_line, = ax_ppi.plot(
-            [0, ppi.max_range_cells * np.sin(az_rad0)],
-            [0, ppi.max_range_cells * np.cos(az_rad0)],
-            color='#ffcc00', linewidth=1.2, linestyle='-', visible=False)
-        range_ring, = ax_ppi.plot([], [], color='#00aaff', linewidth=1.5,
-                                   linestyle='-', visible=False)
-        ppi_tick, = ax_ppi.plot([], [], color='#ff4444', linewidth=2.0, solid_capstyle='round')
-
-        if save_path:
-            fig_ppi.savefig(save_path, dpi=150, bbox_inches='tight',
-                            facecolor=fig_ppi.get_facecolor())
-            print(f"  PPI saved: {save_path}")
-
-        if display:
-            ascope_ref      = [None]
-            ascope_instance = [None]
-
-            def _toggle_ascope_static():
-                if ascope_ref[0] is not None:
-                    old_asc = ascope_ref[0]
-                    ascope_ref[0] = None
-                    az_line.set_visible(False)
-                    range_ring.set_visible(False)
-                    ppi_tick.set_data([], [])
-                    fig_ppi.canvas.draw_idle()
-                    old_asc.clear()
-                    _ascope_hide(old_asc.fig)
-                else:
-                    if ascope_instance[0] is None:
-                        a = AScope(ppi, initial_azimuth=initial_azimuth, log_compress=log_compress)
-                        ascope_instance[0] = a
-                        def _on_x_close(_evt):
-                            ascope_ref[0] = None
-                            ascope_instance[0] = None
-                            az_line.set_visible(False)
-                            range_ring.set_visible(False)
-                            ppi_tick.set_data([], [])
-                            t = fig_ppi.canvas.new_timer(interval=50)
-                            def _sync():
-                                ppi_btns['sync_ascope'](False)
-                                t.stop()
-                            t.add_callback(_sync)
-                            t.start()
-                        a.fig.canvas.mpl_connect('close_event', _on_x_close)
-                    ascope_ref[0] = ascope_instance[0]
-                    _setup_ppi_overlay(ascope_ref[0], az_line, range_ring, ppi_tick, ppi, fig_ppi,
-                                       on_mode_extra=ppi_btns.get('sync_mode'))
-                    ascope_ref[0].render()
-                    _ascope_show(ascope_ref[0].fig)
-
-            playback_state = {'paused': False}
-            ppi_btns = _setup_ppi_buttons(fig_ppi, ax_ppi, ppi, ascope_ref, _toggle_ascope_static,
-                                          playback_state, toggle_pause_fn=None)
-
-            _attach_ppi_scroll_zoom(fig_ppi, ax_ppi, ppi)
-
-            # ── PPI click → A-Scope ──────────────────────────────────────────
-            def on_ppi_click(event):
-                if ppi_btns['zoom_active'][0]:
-                    return
-                if getattr(event, 'dblclick', False):
-                    return
-                if event.inaxes != ax_ppi or event.xdata is None:
-                    return
-                asc = ascope_ref[0]
-                if asc is None:
-                    return
-                if event.button == 3:
-                    _toggle_ascope_mode(fig_ppi, asc)
-                    return
-                if event.button != 1:
-                    return
-                new_az = asc.handle_ppi_click(event.xdata, event.ydata)
-                if new_az is not None:
-                    az_rad = np.deg2rad(new_az)
-                    az_line.set_data(
-                        [0, ppi.max_range_cells * np.sin(az_rad)],
-                        [0, ppi.max_range_cells * np.cos(az_rad)])
-                    az_line.set_visible(True)
-                else:
-                    _t = np.linspace(0, 2*np.pi, 361)
-                    _rc = float(asc.range_cell)
-                    range_ring.set_data(_rc*np.sin(_t), _rc*np.cos(_t))
-                    range_ring.set_visible(True)
-                fig_ppi.canvas.draw_idle()
-
-            fig_ppi.canvas.mpl_connect('button_press_event', on_ppi_click)
-
-            print("  ┌─────────────────────────────────────────────┐")
-            print("  │  PPI window:  Click → update A-Scope        │")
-            print("  │  A-Scope:     Mouse → measurement line + values │")
-            print("  └─────────────────────────────────────────────┘\n")
-
-            plt.show()
-
-    return messages
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Replay mode (PCAP time-controlled)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def replay_pcap(filepath: str, speed: float = 1.0,
-                initial_azimuth: float = 0.0,
                 filter_stream: Optional[Tuple[str, int]] = None,
                 log_compress: bool = False,
-                loop: bool = False):
+                loop: bool = False,
+                no_filter: bool = False):
     """
     Plays back a PCAP file in a time-controlled manner.
     A background thread reads packets with original timing (× speed),
     the main thread renders PPI + A-Scope via FuncAnimation.
     filter_stream: (dst_ip, dst_port) or None → determined via scan + selection.
+    no_filter: show all UDP streams in selection, not only detected CAT240 streams.
     """
     import queue
     import matplotlib.pyplot as plt
@@ -2293,14 +2132,23 @@ def replay_pcap(filepath: str, speed: float = 1.0,
     print(f"{'='*60}")
 
     # ── Stream selection ──────────────────────────────────────────────────────
+    all_streams = None
     if filter_stream is None:
         print("  Scanning streams ...")
         all_streams = scan_pcap_streams(filepath)
-        filter_stream = _prompt_stream_selection(all_streams)
+        filter_stream = _prompt_stream_selection(all_streams, no_filter=no_filter)
+        if filter_stream is None:
+            print("  Aborted.")
+            return
 
     sel_ip, sel_port = filter_stream
     mc = ' (Multicast)' if _is_multicast(sel_ip) else ''
-    print(f"  Selected stream:     {sel_ip}:{sel_port}{mc}")
+    src_str = ''
+    if all_streams and filter_stream in all_streams:
+        src_ips = all_streams[filter_stream][2]
+        if src_ips:
+            src_str = f'  src: {", ".join(sorted(src_ips))}'
+    print(f"  Selected stream:     {sel_ip}:{sel_port}{mc}{src_str}")
     print(f"{'='*60}\n")
 
     decoder       = Cat240Decoder()
@@ -2317,7 +2165,7 @@ def replay_pcap(filepath: str, speed: float = 1.0,
                 reader  = PcapReader(filepath)
                 t0_pcap = None
                 t0_real = time.time()
-                for ts, udp, dst_ip, dst_port in reader.packets():
+                for ts, udp, _src_ip, dst_ip, dst_port in reader.packets():
                     if (dst_ip, dst_port) != filter_stream:
                         continue
                     pause_event.wait()   # blockiert wenn pausiert
@@ -2362,10 +2210,8 @@ def replay_pcap(filepath: str, speed: float = 1.0,
     ascope_instance = [None]
 
     # Selection line (click) + range ring + cursor crosshair
-    az_rad0 = np.deg2rad(initial_azimuth)
     az_sel_line, = ax_ppi.plot(
-        [0, ppi.max_range_cells * np.sin(az_rad0)],
-        [0, ppi.max_range_cells * np.cos(az_rad0)],
+        [0, 0], [0, ppi.max_range_cells],
         color='#ffcc00', linewidth=1.2, linestyle='-', visible=False)
     range_ring, = ax_ppi.plot([], [], color='#00aaff', linewidth=1.5,
                                linestyle='-', visible=False)
@@ -2385,7 +2231,7 @@ def replay_pcap(filepath: str, speed: float = 1.0,
             _ascope_hide(old_asc.fig)
         else:
             if ascope_instance[0] is None:
-                a = AScope(ppi, initial_azimuth=initial_azimuth, log_compress=log_compress)
+                a = AScope(ppi, log_compress=log_compress)
                 ascope_instance[0] = a
                 def _on_x_close(_evt):
                     ascope_ref[0] = None
@@ -2475,7 +2321,7 @@ def replay_pcap(filepath: str, speed: float = 1.0,
     print(f"  Close window to quit.\n")
 
     ani = animation.FuncAnimation(fig_ppi, update,   # noqa: F841
-                                  interval=200,
+                                  interval=50,
                                   cache_frame_data=False)
     plt.show()
 
@@ -2486,8 +2332,6 @@ def replay_pcap(filepath: str, speed: float = 1.0,
 
 def live_stream(host: str = '0.0.0.0', port: int = 5000,
                 multicast_group: Optional[str] = None,
-                update_interval: float = 0.5,
-                initial_azimuth: float = 0.0,
                 log_compress: bool = False):
     """
     Receives CAT240 datagrams live via UDP and updates
@@ -2554,10 +2398,8 @@ def live_stream(host: str = '0.0.0.0', port: int = 5000,
     playback_state  = {'paused': False}
 
     # Azimuth line + range ring (after initial render!)
-    az_rad0 = np.deg2rad(initial_azimuth)
     az_line, = ax_ppi.plot(
-        [0, ppi.max_range_cells * np.sin(az_rad0)],
-        [0, ppi.max_range_cells * np.cos(az_rad0)],
+        [0, 0], [0, ppi.max_range_cells],
         color='#ffcc00', linewidth=1.2, linestyle='-', visible=False)
     range_ring, = ax_ppi.plot([], [], color='#00aaff', linewidth=1.5,
                                linestyle='-', visible=False)
@@ -2577,7 +2419,7 @@ def live_stream(host: str = '0.0.0.0', port: int = 5000,
             _ascope_hide(old_asc.fig)
         else:
             if ascope_instance[0] is None:
-                a = AScope(ppi, initial_azimuth=initial_azimuth, log_compress=log_compress)
+                a = AScope(ppi, log_compress=log_compress)
                 ascope_instance[0] = a
                 def _on_x_close(_evt):
                     ascope_ref[0] = None
@@ -2642,7 +2484,7 @@ def live_stream(host: str = '0.0.0.0', port: int = 5000,
         return az_line,
 
     ani = animation.FuncAnimation(fig_ppi, update,
-                                  interval=int(update_interval * 1000),
+                                  interval=100,
                                   cache_frame_data=False)
     plt.show()
 
@@ -2657,21 +2499,22 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__
     )
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument('--file',   metavar='PCAP', help='Analyze a PCAP/PCAPNG file (static)')
-    group.add_argument('--replay', metavar='PCAP', help='Play back a PCAP/PCAPNG file in a time-controlled manner')
-    group.add_argument('--live',   action='store_true', help='Live UDP reception')
+    mode_group = parser.add_mutually_exclusive_group(required=True)
+    mode_group.add_argument('--replay', metavar='PCAP', help='Play back a PCAP/PCAPNG file in a time-controlled manner')
+    mode_group.add_argument('--live',   action='store_true', help='Live UDP reception')
 
-    parser.add_argument('--port',       type=int,   default=None,      help='UDP port (live, default: interactive)')
-    parser.add_argument('--host',       type=str,   default='0.0.0.0', help='Bind address/interface (default: 0.0.0.0)')
-    parser.add_argument('--multicast',  type=str,   default=None,      help='Multicast group (live, e.g. 239.1.1.1)')
-    parser.add_argument('--stream',     type=str,   default=None,      help='Stream filter IP:PORT for --file/--replay')
-    parser.add_argument('--azimuth',    type=float, default=0.0,       help='Start azimuth for A-Scope in degrees (default: 0)')
-    parser.add_argument('--speed',      type=float, default=1.0,       help='Playback speed for --replay (default: 1.0)')
-    parser.add_argument('--loop',       action='store_true',           help='Loop --replay continuously (clears PPI on each restart)')
-    parser.add_argument('--no-display',   action='store_true',         help='Do not show PPI/A-Scope window')
-    parser.add_argument('--save',         metavar='PNG',               help='Save PPI as PNG file')
-    parser.add_argument('--log-compress', action='store_true',         help='Show log-compressed A-Scope overlay (0–255, P₀ auto-estimated)')
+    replay_group = parser.add_argument_group('replay options')
+    replay_group.add_argument('--speed',     type=float, default=1.0, help='Playback speed multiplier (default: 1.0)')
+    replay_group.add_argument('--loop',      action='store_true',     help='Loop continuously; PPI is cleared on each restart')
+    replay_group.add_argument('--stream',    type=str,   default=None, help='Pre-select stream IP:PORT, skips interactive prompt')
+    replay_group.add_argument('--no-filter', action='store_true',     help='Show all UDP streams for selection, not only detected CAT240 streams')
+
+    live_group = parser.add_argument_group('live options')
+    live_group.add_argument('--port',      type=int, default=None,      help='UDP port (default: interactive prompt)')
+    live_group.add_argument('--host',      type=str, default='0.0.0.0', help='Bind address / interface (default: 0.0.0.0)')
+    live_group.add_argument('--multicast', type=str, default=None,      help='Multicast group to join (e.g. 239.1.1.1)')
+
+    parser.add_argument('--log-compress', action='store_true', help='Show log-compressed A-Scope overlay (0-255, P0 auto-estimated)')
     parser.add_argument('--verbose',      action='store_true', default=True)
 
     args = parser.parse_args()
@@ -2703,24 +2546,13 @@ def main():
             default_multicast = args.multicast or '',
         )
         live_stream(host=host, port=port, multicast_group=multicast,
-                    initial_azimuth=args.azimuth,
                     log_compress=args.log_compress)
-    elif args.replay:
+    else:
         replay_pcap(filepath=args.replay, speed=args.speed,
-                    initial_azimuth=args.azimuth,
                     filter_stream=filter_stream,
                     log_compress=args.log_compress,
-                    loop=args.loop)
-    else:
-        analyze_pcap(
-            filepath         = args.file,
-            display          = not args.no_display,
-            save_path        = args.save,
-            verbose          = args.verbose,
-            initial_azimuth  = args.azimuth,
-            filter_stream    = filter_stream,
-            log_compress     = args.log_compress,
-        )
+                    loop=args.loop,
+                    no_filter=args.no_filter)
 
 
 if __name__ == '__main__':

@@ -46,19 +46,7 @@ pip install -r requirements.txt
 
 ### `cat240_analyzer.py` — PPI & A-Scope Visualizer
 
-Decodes a PCAP/PCAPNG file (or a live UDP stream) and displays the radar video as a polar PPI image with an interactive A-Scope.
-
-#### Analyse a file (static)
-
-```bash
-python cat240_analyzer.py --file Data/recording.pcapng
-```
-
-If the file contains multiple UDP streams, you will be prompted to select one. You can also pass the stream directly:
-
-```bash
-python cat240_analyzer.py --file Data/recording.pcapng --stream 239.0.0.1:4379
-```
+Decodes a PCAP/PCAPNG recording or a live UDP stream and displays the radar video as a polar PPI image with an interactive A-Scope.
 
 #### Replay a file (time-controlled animation)
 
@@ -81,18 +69,32 @@ python cat240_analyzer.py --live
 
 # Direct with port and optional multicast group:
 python cat240_analyzer.py --live --port 4379 --multicast 239.0.0.1
+
+# Multicast on a specific interface:
+python cat240_analyzer.py --live --port 4379 --multicast 239.0.0.1 --host 192.168.1.10
 ```
 
-#### Additional options
+#### Live options
 
 | Option | Description |
 |---|---|
-| `--azimuth N` | Initial A-Scope azimuth in degrees (default: 0) |
-| `--save FILE.png` | Save PPI as PNG and exit |
-| `--no-display` | Decode only, no GUI |
-| `--stream IP:PORT` | Pre-select a UDP stream (skip interactive prompt) |
-| `--speed X` | Replay speed multiplier (default: 1.0) |
-| `--loop` | Loop `--replay` continuously; PPI is cleared on each restart |
+| `--port N` | UDP port (default: interactive prompt) |
+| `--host IP` | Bind address / interface (default: `0.0.0.0`) |
+| `--multicast IP` | Join multicast group (e.g. `239.0.0.1`) |
+
+#### Replay options
+
+| Option | Description |
+|---|---|
+| `--speed X` | Playback speed multiplier (default: 1.0) |
+| `--loop` | Loop continuously; PPI is cleared on each restart |
+| `--stream IP:PORT` | Pre-select a UDP stream, skips interactive prompt |
+| `--no-filter` | Show all UDP streams for selection, not only detected CAT240 streams |
+
+#### General options
+
+| Option | Description |
+|---|---|
 | `--log-compress` | Add soft-log overlay to A-Scope (second Y-axis, 0–255) |
 
 #### PPI buttons
@@ -138,6 +140,7 @@ python cat240_stream_info.py Data/recording.pcapng --pdf report.pdf
 ```
 
 The report includes per-stream:
+- Source IP address(es) and destination IP:port
 - Cells per azimuth, bit depth, start cell, compression
 - Azimuth step size, azimuths per revolution, RPM
 - CELL_DUR raw value with derived range per cell and total range

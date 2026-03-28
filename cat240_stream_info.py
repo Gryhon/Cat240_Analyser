@@ -265,7 +265,7 @@ class PcapReader:
         self._frag_buffer: dict = {}
 
     def packets(self):
-        """Yields (timestamp, udp_payload, dst_ip, dst_port)."""
+        """Yields (timestamp, udp_payload, src_ip, dst_ip, dst_port)."""
         with open(self.filepath, 'rb') as f:
             magic = struct.unpack('<I', f.read(4))[0]
             f.seek(0)
@@ -308,12 +308,12 @@ class PcapReader:
                 if len(ip_payload) < 8: return None
                 dst_port = struct.unpack('>H', ip_payload[2:4])[0]
                 udp_len  = struct.unpack('>H', ip_payload[4:6])[0]
-                return ip_payload[8:udp_len], dst_ip, dst_port
+                return ip_payload[8:udp_len], src_ip, dst_ip, dst_port
 
             # IP-Fragmentierung: Fragmente sammeln und reassemblieren
             key = (src_ip, dst_ip, 17, ip_id)
             if key not in self._frag_buffer:
-                self._frag_buffer[key] = {'frags': {}, 'last_off': -1}
+                self._frag_buffer[key] = {'frags': {}, 'last_off': -1, 'src_ip': src_ip}
             entry = self._frag_buffer[key]
             entry['frags'][frag_off] = ip_payload
             if not mf:
@@ -329,7 +329,7 @@ class PcapReader:
             if len(total) < 8: return None
             dst_port = struct.unpack('>H', bytes(total[2:4]))[0]
             udp_len  = struct.unpack('>H', bytes(total[4:6]))[0]
-            return bytes(total[8:udp_len]), dst_ip, dst_port
+            return bytes(total[8:udp_len]), entry['src_ip'], dst_ip, dst_port
         except Exception:
             return None
 
@@ -345,7 +345,7 @@ class PcapReader:
             raw = f.read(incl_len)
             if len(raw) < incl_len: break
             r = self._extract_udp(raw, link_type)
-            if r: yield ts_sec + ts_usec / 1e6, r[0], r[1], r[2]
+            if r: yield ts_sec + ts_usec / 1e6, r[0], r[1], r[2], r[3]
 
     def _read_pcapng(self, f):
         endian, link_type = '<', 1
@@ -368,10 +368,10 @@ class PcapReader:
                 if len(body) >= 20:
                     ts_hi, ts_lo, cap_len, _ = struct.unpack(endian + 'IIII', body[4:20])
                     r = self._extract_udp(body[20:20 + cap_len], link_type)
-                    if r: yield ((ts_hi << 32) | ts_lo) / 1e6, r[0], r[1], r[2]
+                    if r: yield ((ts_hi << 32) | ts_lo) / 1e6, r[0], r[1], r[2], r[3]
             elif block_type == 0x00000003:
                 r = self._extract_udp(body[4:], link_type)
-                if r: yield 0.0, r[0], r[1], r[2]
+                if r: yield 0.0, r[0], r[1], r[2], r[3]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -383,6 +383,7 @@ class StreamStats:
 
     def __init__(self, key: str):
         self.key         = key          # e.g. "239.0.0.1:5000"
+        self.src_ips: set = set()       # source IP addresses observed
         self.sac_sic     = Counter()    # (sac, sic) → count
         self.msg_count   = 0
         self.cell_counts = Counter()
@@ -405,9 +406,11 @@ class StreamStats:
         self.amp_sample  = []           # max 200k values for histogram
         self._AMP_LIMIT  = 200_000
 
-    def add(self, msg: Cat240Message, ts: float):
+    def add(self, msg: Cat240Message, ts: float, src_ip: str = ''):
         self.msg_count += 1
         self.timestamps.append(ts)
+        if src_ip:
+            self.src_ips.add(src_ip)
         self.sac_sic[(msg.sac, msg.sic)] += 1
         self.cell_counts[msg.num_cells] += 1
         self.crg_counts[msg.cell_duration_raw] += 1
@@ -463,7 +466,7 @@ def analyse(filepath: str, max_packets: int = 0) -> Dict[str, StreamStats]:
         ) as progress:
             task = progress.add_task(f"Reading {filepath.split('/')[-1]} …", total=max_packets or None)
 
-            for pkt_idx, (ts, payload, dst_ip, dst_port) in enumerate(reader.packets()):
+            for pkt_idx, (ts, payload, src_ip, dst_ip, dst_port) in enumerate(reader.packets()):
                 if max_packets and pkt_idx >= max_packets:
                     break
                 progress.advance(task)
@@ -480,9 +483,9 @@ def analyse(filepath: str, max_packets: int = 0) -> Dict[str, StreamStats]:
                     net_key = f"{dst_ip}:{dst_port}"
                     if net_key not in streams:
                         streams[net_key] = StreamStats(net_key)
-                    streams[net_key].add(msg, ts)
+                    streams[net_key].add(msg, ts, src_ip)
     else:
-        for pkt_idx, (ts, payload, dst_ip, dst_port) in enumerate(reader.packets()):
+        for pkt_idx, (ts, payload, src_ip, dst_ip, dst_port) in enumerate(reader.packets()):
             if max_packets and pkt_idx >= max_packets:
                 break
             if pkt_idx % 5000 == 0 and pkt_idx:
@@ -497,7 +500,7 @@ def analyse(filepath: str, max_packets: int = 0) -> Dict[str, StreamStats]:
                 net_key = f"{dst_ip}:{dst_port}"
                 if net_key not in streams:
                     streams[net_key] = StreamStats(net_key)
-                streams[net_key].add(msg, ts)
+                streams[net_key].add(msg, ts, src_ip)
 
     return streams, total_udp, non_cat240
 
@@ -622,6 +625,7 @@ def print_report(filepath: str, streams: Dict[str, StreamStats],
         show_header=True, header_style="bold magenta",
     )
     overview.add_column("#",             style="dim",    justify="right", width=3)
+    overview.add_column("Src IP",        style="green",  min_width=15)
     overview.add_column("Dst IP:Port",   style="cyan",   min_width=20)
     overview.add_column("SAC / SIC",     style="yellow", justify="center")
     overview.add_column("Messages",      style="green",  justify="right")
@@ -646,8 +650,9 @@ def print_report(filepath: str, streams: Dict[str, StreamStats],
         fspec  = ", ".join(f"0x{f}" for f, _ in s.fspec_counts.most_common(2))
         pct    = f"{100*s.msg_count/total_msgs:.1f}%" if total_msgs else "?"
 
+        src_ips_str = ", ".join(sorted(s.src_ips)) if s.src_ips else "?"
         overview.add_row(
-            str(idx), key, sac_sic_str,
+            str(idx), src_ips_str, key, sac_sic_str,
             f"{s.msg_count:,}", pct, cells_str,
             bits_str, spokes, rpm, fspec,
         )
@@ -737,6 +742,7 @@ def print_report(filepath: str, streams: Dict[str, StreamStats],
         # SAC/SIC
         left.add_row("", "")
         left.add_row("[bold magenta]── Data source ──", "")
+        left.add_row("Src IP", ", ".join(sorted(s.src_ips)) if s.src_ips else "?")
         for (sac, sic), cnt in s.sac_sic.most_common():
             pct = 100 * cnt / s.msg_count if s.msg_count else 0
             left.add_row(f"SAC={sac} / SIC={sic}",
@@ -803,7 +809,8 @@ def print_report_plain(filepath, streams, total_udp, non_cat240):
     for key, s in sorted(streams.items()):
         az = _az_stats(s)
         amp = _amp_stats(s)
-        print(f"\n[{key}]  {s.msg_count:,} messages")
+        src_ips_str = ", ".join(sorted(s.src_ips)) if s.src_ips else "?"
+        print(f"\n[{key}]  src: {src_ips_str}  {s.msg_count:,} messages")
         print(f"  SAC/SIC       : {dict(s.sac_sic.most_common(3))}")
         print(f"  Cells/azimuth : {dict(s.cell_counts.most_common())}")
         print(f"  Bit/cell      : {dict(s.cell_bits.most_common())}")
@@ -859,8 +866,8 @@ def write_markdown(filepath: str, streams: Dict[str, StreamStats],
     # ── Overview table ───────────────────────────────────────────────────────
     w("## Stream overview")
     w()
-    w("| # | Dst IP:Port | SAC/SIC | Messages | Share | Cells/az | Bit/cell | Az/rev | RPM | FSPEC |")
-    w("|---|---|---|---|---|---|---|---|---|---|")
+    w("| # | Src IP | Dst IP:Port | SAC/SIC | Messages | Share | Cells/az | Bit/cell | Az/rev | RPM | FSPEC |")
+    w("|---|---|---|---|---|---|---|---|---|---|---|")
     for idx, (key, s) in enumerate(sorted(streams.items()), 1):
         az  = _az_stats(s)
         sac_sic = ", ".join(f"{a}/{b}" for (a,b),_ in s.sac_sic.most_common(2))
@@ -870,7 +877,8 @@ def write_markdown(filepath: str, streams: Dict[str, StreamStats],
         rpm = f"{az['rpm_timestamps']:.1f}" if 'rpm_timestamps' in az else '?'
         fspec = ", ".join(f"`0x{f}`" for f,_ in s.fspec_counts.most_common(2))
         pct   = f"{100*s.msg_count/total_msgs:.1f}%" if total_msgs else "?"
-        w(f"| {idx} | `{key}` | {sac_sic} | {s.msg_count:,} | {pct} | {cells} | {bits} | {spokes} | {rpm} | {fspec} |")
+        src_ips_str = ", ".join(sorted(s.src_ips)) if s.src_ips else "?"
+        w(f"| {idx} | {src_ips_str} | `{key}` | {sac_sic} | {s.msg_count:,} | {pct} | {cells} | {bits} | {spokes} | {rpm} | {fspec} |")
     w()
 
     # ── Per-stream detail ────────────────────────────────────────────────────
@@ -956,6 +964,8 @@ def write_markdown(filepath: str, streams: Dict[str, StreamStats],
         w()
         w("| Parameter | Value |")
         w("|---|---|")
+        src_ips_str = ", ".join(sorted(s.src_ips)) if s.src_ips else "?"
+        w(f"| Src IP | {src_ips_str} |")
         for (sac, sic), cnt in s.sac_sic.most_common():
             pct = 100 * cnt / s.msg_count if s.msg_count else 0
             w(f"| SAC / SIC | {sac} / {sic} ({cnt:,}×, {pct:.1f}%) |")
@@ -1191,9 +1201,9 @@ def write_pdf(filepath: str, streams: Dict[str, StreamStats],
 
     # ── Stream-Übersicht ──────────────────────────────────────────────────────
     h2('Stream Overview')
-    hdrs = ['#', 'Dst IP:Port', 'SAC/SIC', 'Messages', 'Share',
+    hdrs = ['#', 'Src IP', 'Dst IP:Port', 'SAC/SIC', 'Messages', 'Share',
             'Cells/az', 'Bit/cell', 'Az/rev', 'RPM', 'FSPEC']
-    cws  = [7, 42, 18, 20, 14, 16, 14, 14, 12, 25]
+    cws  = [7, 32, 38, 18, 20, 14, 16, 14, 14, 12, 25]
     rows_ov = []
     for idx, (key, s) in enumerate(sorted(streams.items()), 1):
         az  = _az_stats(s)
@@ -1204,7 +1214,8 @@ def write_pdf(filepath: str, streams: Dict[str, StreamStats],
         rpm     = f"{az['rpm_timestamps']:.1f}" if 'rpm_timestamps' in az else '?'
         fspec   = ', '.join(f"0x{f}" for f, _ in s.fspec_counts.most_common(2))
         pct     = f"{100 * s.msg_count / total_msgs:.1f}%" if total_msgs else '?'
-        rows_ov.append([str(idx), key, sac_sic, f'{s.msg_count:,}', pct,
+        src_ips_str = ', '.join(sorted(s.src_ips)) if s.src_ips else '?'
+        rows_ov.append([str(idx), src_ips_str, key, sac_sic, f'{s.msg_count:,}', pct,
                         cells, bits, spokes, rpm, fspec])
     wide_table(hdrs, rows_ov, cws)
 
@@ -1285,6 +1296,8 @@ def write_pdf(filepath: str, streams: Dict[str, StreamStats],
         # Data source / FSPEC
         h3('Data Source & FSPEC')
         ds_rows = []
+        src_ips_str = ', '.join(sorted(s.src_ips)) if s.src_ips else '?'
+        ds_rows.append(('Src IP', src_ips_str))
         for (sac, sic), cnt in s.sac_sic.most_common():
             pct = 100 * cnt / s.msg_count if s.msg_count else 0
             ds_rows.append((f'SAC / SIC', f'{sac} / {sic}  ({cnt:,}×, {pct:.1f}%)'))
