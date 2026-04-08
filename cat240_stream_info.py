@@ -569,6 +569,13 @@ def _az_stats(stats: StreamStats):
     return r
 
 
+def _stream_sort_key(item):
+    """Sorts streams by src IP (numeric) then by stream key."""
+    key, s = item
+    ip = min(s.src_ips) if s.src_ips else '0.0.0.0'
+    return (tuple(int(x) for x in ip.split('.')), key)
+
+
 def _amp_stats(stats: StreamStats):
     r = {}
     if not stats.amp_n:
@@ -629,14 +636,13 @@ def print_report(filepath: str, streams: Dict[str, StreamStats],
     overview.add_column("Dst IP:Port",   style="cyan",   min_width=20)
     overview.add_column("SAC / SIC",     style="yellow", justify="center")
     overview.add_column("Messages",      style="green",  justify="right")
-    overview.add_column("Share",         style="white",  justify="right")
     overview.add_column("Cells/az",      style="white",  justify="center")
     overview.add_column("Bit/cell",      style="white",  justify="center")
     overview.add_column("Az/rev",        style="white",  justify="right")
     overview.add_column("RPM",           style="white",  justify="right")
     overview.add_column("FSPEC",         style="dim",    justify="center")
 
-    for idx, (key, s) in enumerate(sorted(streams.items()), 1):
+    for idx, (key, s) in enumerate(sorted(streams.items(), key=_stream_sort_key), 1):
         sac_sic_str = ", ".join(
             f"{sac}/{sic}" for (sac, sic), _ in s.sac_sic.most_common(3)
         )
@@ -648,19 +654,17 @@ def print_report(filepath: str, streams: Dict[str, StreamStats],
         spokes = str(az.get('spokes_per_rev', '?'))
         rpm = f"{az['rpm_timestamps']:.1f}" if 'rpm_timestamps' in az else '?'
         fspec  = ", ".join(f"0x{f}" for f, _ in s.fspec_counts.most_common(2))
-        pct    = f"{100*s.msg_count/total_msgs:.1f}%" if total_msgs else "?"
-
         src_ips_str = ", ".join(sorted(s.src_ips)) if s.src_ips else "?"
         overview.add_row(
             str(idx), src_ips_str, key, sac_sic_str,
-            f"{s.msg_count:,}", pct, cells_str,
+            f"{s.msg_count:,}", cells_str,
             bits_str, spokes, rpm, fspec,
         )
 
     console.print(overview)
 
     # ── Per-stream detail block ──────────────────────────────────────────────
-    for idx, (key, s) in enumerate(sorted(streams.items()), 1):
+    for idx, (key, s) in enumerate(sorted(streams.items(), key=_stream_sort_key), 1):
         dur_s = max(s.timestamps) - min(s.timestamps) if s.timestamps else 0
         az    = _az_stats(s)
         amp   = _amp_stats(s)
@@ -806,7 +810,7 @@ def print_report_plain(filepath, streams, total_udp, non_cat240):
     print(f"\n{sep}\nCAT240 ANALYSIS: {filepath}\n{sep}")
     print(f"UDP packets: {total_udp}  |  CAT240: {total_msgs}  |  Streams: {len(streams)}"
           + (f"  |  Non-CAT240: {non_cat240}" if non_cat240 else "") + "\n")
-    for key, s in sorted(streams.items()):
+    for key, s in sorted(streams.items(), key=_stream_sort_key):
         az = _az_stats(s)
         amp = _amp_stats(s)
         src_ips_str = ", ".join(sorted(s.src_ips)) if s.src_ips else "?"
@@ -866,9 +870,9 @@ def write_markdown(filepath: str, streams: Dict[str, StreamStats],
     # ── Overview table ───────────────────────────────────────────────────────
     w("## Stream overview")
     w()
-    w("| # | Src IP | Dst IP:Port | SAC/SIC | Messages | Share | Cells/az | Bit/cell | Az/rev | RPM | FSPEC |")
-    w("|---|---|---|---|---|---|---|---|---|---|---|")
-    for idx, (key, s) in enumerate(sorted(streams.items()), 1):
+    w("| # | Src IP | Dst IP:Port | SAC/SIC | Messages | Cells/az | Bit/cell | Az/rev | RPM | FSPEC |")
+    w("|---|---|---|---|---|---|---|---|---|---|")
+    for idx, (key, s) in enumerate(sorted(streams.items(), key=_stream_sort_key), 1):
         az  = _az_stats(s)
         sac_sic = ", ".join(f"{a}/{b}" for (a,b),_ in s.sac_sic.most_common(2))
         cells   = " / ".join(str(c) for c,_ in s.cell_counts.most_common(3))
@@ -876,13 +880,12 @@ def write_markdown(filepath: str, streams: Dict[str, StreamStats],
         spokes  = str(az.get('spokes_per_rev', '?'))
         rpm = f"{az['rpm_timestamps']:.1f}" if 'rpm_timestamps' in az else '?'
         fspec = ", ".join(f"`0x{f}`" for f,_ in s.fspec_counts.most_common(2))
-        pct   = f"{100*s.msg_count/total_msgs:.1f}%" if total_msgs else "?"
         src_ips_str = ", ".join(sorted(s.src_ips)) if s.src_ips else "?"
-        w(f"| {idx} | {src_ips_str} | `{key}` | {sac_sic} | {s.msg_count:,} | {pct} | {cells} | {bits} | {spokes} | {rpm} | {fspec} |")
+        w(f"| {idx} | {src_ips_str} | `{key}` | {sac_sic} | {s.msg_count:,} | {cells} | {bits} | {spokes} | {rpm} | {fspec} |")
     w()
 
     # ── Per-stream detail ────────────────────────────────────────────────────
-    for idx, (key, s) in enumerate(sorted(streams.items()), 1):
+    for idx, (key, s) in enumerate(sorted(streams.items(), key=_stream_sort_key), 1):
         dur_s = max(s.timestamps) - min(s.timestamps) if s.timestamps else 0
         az    = _az_stats(s)
         amp   = _amp_stats(s)
@@ -945,10 +948,9 @@ def write_markdown(filepath: str, streams: Dict[str, StreamStats],
         unit_lbl = {'ns': 'I240/040 nanoseconds', 'fs': 'I240/041 femtoseconds'}.get(s.cell_dur_unit, '?')
         w(f"### CELL_DUR (cell duration, {unit_lbl})")
         w()
-        w("| CELL_DUR value | Messages | Share | Note |")
-        w("|---|---|---|---|")
+        w("| CELL_DUR value | Messages | Note |")
+        w("|---|---|---|")
         for crg, cnt in sorted(s.crg_counts.items()):
-            pct = 100 * cnt / s.msg_count if s.msg_count else 0
             scale = 1e-15 if s.cell_dur_unit == 'fs' else 1e-9
             range_m = 3e8 * (crg * scale) / 2.0
             total_cells = s.cell_counts.most_common(1)[0][0] if s.cell_counts else 0
@@ -956,7 +958,7 @@ def write_markdown(filepath: str, streams: Dict[str, StreamStats],
                 note = f"{range_m:.2f} m/cell → ~{total_cells * range_m / 1852:.0f} nm range"
             else:
                 note = f"[{unit_lbl}]"
-            w(f"| {crg} | {cnt:,} | {pct:.1f}% | {note} |")
+            w(f"| {crg} | {cnt:,} | {note} |")
         w()
 
         # Data source
@@ -1201,11 +1203,11 @@ def write_pdf(filepath: str, streams: Dict[str, StreamStats],
 
     # ── Stream-Übersicht ──────────────────────────────────────────────────────
     h2('Stream Overview')
-    hdrs = ['#', 'Src IP', 'Dst IP:Port', 'SAC/SIC', 'Messages', 'Share',
+    hdrs = ['#', 'Src IP', 'Dst IP:Port', 'SAC/SIC', 'Messages',
             'Cells/az', 'Bit/cell', 'Az/rev', 'RPM', 'FSPEC']
-    cws  = [7, 32, 38, 18, 20, 14, 16, 14, 14, 12, 25]
+    cws  = [7, 32, 38, 18, 20, 16, 14, 14, 12, 25]
     rows_ov = []
-    for idx, (key, s) in enumerate(sorted(streams.items()), 1):
+    for idx, (key, s) in enumerate(sorted(streams.items(), key=_stream_sort_key), 1):
         az  = _az_stats(s)
         sac_sic = ', '.join(f'{a}/{b}' for (a, b), _ in s.sac_sic.most_common(2))
         cells   = '/'.join(str(c) for c, _ in s.cell_counts.most_common(2))
@@ -1213,14 +1215,13 @@ def write_pdf(filepath: str, streams: Dict[str, StreamStats],
         spokes  = f"~{az['spokes_per_rev']}" if 'spokes_per_rev' in az else '?'
         rpm     = f"{az['rpm_timestamps']:.1f}" if 'rpm_timestamps' in az else '?'
         fspec   = ', '.join(f"0x{f}" for f, _ in s.fspec_counts.most_common(2))
-        pct     = f"{100 * s.msg_count / total_msgs:.1f}%" if total_msgs else '?'
         src_ips_str = ', '.join(sorted(s.src_ips)) if s.src_ips else '?'
-        rows_ov.append([str(idx), src_ips_str, key, sac_sic, f'{s.msg_count:,}', pct,
+        rows_ov.append([str(idx), src_ips_str, key, sac_sic, f'{s.msg_count:,}',
                         cells, bits, spokes, rpm, fspec])
     wide_table(hdrs, rows_ov, cws)
 
     # ── Pro-Stream-Details ────────────────────────────────────────────────────
-    for idx, (key, s) in enumerate(sorted(streams.items()), 1):
+    for idx, (key, s) in enumerate(sorted(streams.items(), key=_stream_sort_key), 1):
         dur_s = max(s.timestamps) - min(s.timestamps) if s.timestamps else 0
         az    = _az_stats(s)
         amp   = _amp_stats(s)
@@ -1387,58 +1388,76 @@ def main():
     parser = argparse.ArgumentParser(
         description="Analyses CAT240 streams in PCAP/PCAPNG files.",
     )
-    parser.add_argument("file", help="Path to the PCAP or PCAPNG file")
+    parser.add_argument("file", nargs="+", help="Path(s) to PCAP or PCAPNG file(s); glob patterns are expanded by the shell")
     parser.add_argument(
         "--packets", "-n", type=int, default=0, metavar="N",
         help="Analyse only the first N UDP packets (0 = all)"
     )
     parser.add_argument(
         "--output", "-o", metavar="FILE.md",
-        help="Path for Markdown output (default: <input>.md)"
+        help="Path for Markdown output (only used when a single file is given; default: <input>_analysis.md)"
     )
     parser.add_argument(
         "--pdf", metavar="FILE.pdf", nargs="?", const="",
-        help="Also generate a PDF report (default path: <input>.pdf)"
+        help="Also generate a PDF report (default path: <input>_analysis.pdf)"
     )
     args = parser.parse_args()
 
-    # Ausgabepfade ableiten
     import os
-    base = os.path.splitext(os.path.basename(args.file))[0]
-    md_path  = args.output if args.output else f"{base}_analysis.md"
-    pdf_path = (args.pdf if args.pdf else f"{base}_analysis.pdf") if args.pdf is not None else None
 
-    try:
-        streams, total_udp, non_cat240 = analyse(args.file, max_packets=args.packets)
-        if not streams:
-            print("No CAT240 messages found.", file=sys.stderr)
-            sys.exit(1)
-        if RICH:
-            print_report(args.file, streams, total_udp, non_cat240)
+    if len(args.file) > 1 and args.output:
+        print("Warning: --output ignored when multiple files are given.", file=sys.stderr)
+
+    exit_code = 0
+    for filepath in args.file:
+        base = os.path.splitext(os.path.basename(filepath))[0]
+        if len(args.file) == 1:
+            md_path  = args.output if args.output else f"{base}_analysis.md"
+            pdf_path = (args.pdf if args.pdf else f"{base}_analysis.pdf") if args.pdf is not None else None
         else:
-            print_report_plain(args.file, streams, total_udp, non_cat240)
+            md_path  = f"{base}_analysis.md"
+            pdf_path = f"{base}_analysis.pdf" if args.pdf is not None else None
 
-        write_markdown(args.file, streams, total_udp, non_cat240,
-                       md_path=md_path)
-        if RICH:
-            console.print(f"[dim]Markdown saved: [cyan]{md_path}[/][/]")
-        else:
-            print(f"Markdown saved: {md_path}")
+        if RICH and len(args.file) > 1:
+            console.rule(f"[bold]{filepath}")
+        elif len(args.file) > 1:
+            print(f"\n=== {filepath} ===")
 
-        if pdf_path is not None:
-            write_pdf(args.file, streams, total_udp, non_cat240, pdf_path)
+        try:
+            streams, total_udp, non_cat240 = analyse(filepath, max_packets=args.packets)
+            if not streams:
+                print(f"No CAT240 messages found in {filepath}.", file=sys.stderr)
+                exit_code = 1
+                continue
             if RICH:
-                console.print(f"[dim]PDF saved:      [cyan]{pdf_path}[/][/]")
+                print_report(filepath, streams, total_udp, non_cat240)
             else:
-                print(f"PDF saved: {pdf_path}")
-    except FileNotFoundError:
-        print(f"Error: file not found: {args.file}", file=sys.stderr)
-        sys.exit(1)
-    except ValueError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
-    except KeyboardInterrupt:
-        print("\nAborted.")
+                print_report_plain(filepath, streams, total_udp, non_cat240)
+
+            write_markdown(filepath, streams, total_udp, non_cat240, md_path=md_path)
+            if RICH:
+                console.print(f"[dim]Markdown saved: [cyan]{md_path}[/][/]")
+            else:
+                print(f"Markdown saved: {md_path}")
+
+            if pdf_path is not None:
+                write_pdf(filepath, streams, total_udp, non_cat240, pdf_path)
+                if RICH:
+                    console.print(f"[dim]PDF saved:      [cyan]{pdf_path}[/][/]")
+                else:
+                    print(f"PDF saved: {pdf_path}")
+        except FileNotFoundError:
+            print(f"Error: file not found: {filepath}", file=sys.stderr)
+            exit_code = 1
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            exit_code = 1
+        except KeyboardInterrupt:
+            print("\nAborted.")
+            break
+
+    if exit_code:
+        sys.exit(exit_code)
 
 
 if __name__ == "__main__":

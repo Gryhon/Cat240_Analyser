@@ -1969,7 +1969,8 @@ def _setup_ppi_buttons(fig_ppi, ax_ppi, ppi, ascope_ref: list,
         fig_ppi.canvas.draw_idle()
 
     return {'sync_ascope': sync_ascope_btn, 'sync_mode': sync_mode_btn,
-            'zoom_active': zoom_active}
+            'zoom_active': zoom_active,
+            '_buttons': [btn_pause, btn_zoom, btn_ascope, btn_mode]}
 
 
 def _attach_ppi_scroll_zoom(fig_ppi, ax_ppi, ppi):
@@ -2366,15 +2367,18 @@ def live_stream(host: str = '0.0.0.0', port: int = 5000,
     print(f"  Close window to quit.\n")
 
     stats = {'pkts': 0, 'msgs': 0}
+    pause_event = threading.Event()
+    pause_event.set()   # gesetzt = läuft; gelöscht = pausiert
 
     def recv_loop():
         while True:
             try:
                 data, _ = sock.recvfrom(65535)
                 stats['pkts'] += 1
-                for msg in decoder.decode_multiple(data):
-                    ppi.add_message(msg)
-                    stats['msgs'] += 1
+                if pause_event.is_set():
+                    for msg in decoder.decode_multiple(data):
+                        ppi.add_message(msg)
+                        stats['msgs'] += 1
             except socket.timeout:
                 pass
             except Exception:
@@ -2438,8 +2442,14 @@ def live_stream(host: str = '0.0.0.0', port: int = 5000,
             ascope_ref[0].render()
             _ascope_show(ascope_ref[0].fig)
 
+    def _toggle_pause_live(paused: bool):
+        if paused:
+            pause_event.clear()
+        else:
+            pause_event.set()
+
     ppi_btns = _setup_ppi_buttons(fig_ppi, ax_ppi, ppi, ascope_ref, _toggle_ascope_live,
-                                  playback_state, toggle_pause_fn=lambda p: None)
+                                  playback_state, toggle_pause_fn=_toggle_pause_live)
     _attach_ppi_scroll_zoom(fig_ppi, ax_ppi, ppi)
 
     def on_ppi_click(event):
