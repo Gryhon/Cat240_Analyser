@@ -120,16 +120,19 @@ python cat240_analyzer.py --live --port 4379 --multicast 239.0.0.1 --host 192.16
 
 ### `cat240_stream_info.py` — Stream Statistics & Report
 
-Scans a PCAP/PCAPNG file, auto-detects all CAT240 streams and prints detailed statistics (geometry, azimuth step, RPM, cell resolution, amplitude distribution). Also writes a Markdown report.
+Scans one or more PCAP/PCAPNG files, auto-detects all CAT240 streams and prints detailed statistics (geometry, azimuth step, RPM, cell resolution, amplitude distribution). Also writes a Markdown report. Streams are sorted by source IP. Glob patterns work on all platforms (including Windows).
 
 ```bash
 # Full analysis, auto-generate <filename>_analysis.md:
 python cat240_stream_info.py Data/recording.pcapng
 
+# Multiple files / glob pattern:
+python cat240_stream_info.py Data/*.pcapng
+
 # Analyse only the first 10 000 UDP packets:
 python cat240_stream_info.py Data/recording.pcapng --packets 10000
 
-# Specify output path for the Markdown report:
+# Specify output path for the Markdown report (single file only):
 python cat240_stream_info.py Data/recording.pcapng --output report.md
 
 # Also generate a PDF report (saved next to the Markdown file):
@@ -150,6 +153,39 @@ The report includes per-stream:
 
 ---
 
+### `cat240_azimuth_check.py` — Azimuth Completeness Check
+
+Analyses one or more PCAP/PCAPNG files and reports how many azimuths are missing per revolution. Only full revolutions (angular span ≥ 340°) are included; partial revolutions at recording start/end are counted separately and skipped. Streams are sorted by source IP. Glob patterns work on all platforms.
+
+```bash
+# Full analysis, auto-generate <filename>_azcheck.md:
+python cat240_azimuth_check.py Data/recording.pcapng
+
+# Multiple files / glob pattern:
+python cat240_azimuth_check.py Data/*.pcapng
+
+# Analyse only the first 10 000 UDP packets:
+python cat240_azimuth_check.py Data/recording.pcapng --packets 10000
+
+# Specify output path for the Markdown report (single file only):
+python cat240_azimuth_check.py Data/recording.pcapng --output report.md
+
+# Also generate a PDF report:
+python cat240_azimuth_check.py Data/recording.pcapng --pdf
+
+# PDF with custom path:
+python cat240_azimuth_check.py Data/recording.pcapng --pdf report.pdf
+```
+
+The report shows per stream:
+- Expected azimuths/revolution and median azimuth step
+- Number of full revolutions analysed (partial revolutions skipped)
+- Distribution: missing count → number of revolutions / percentage
+- Worst revolutions (index + timestamp)
+- Most frequently missing azimuth positions (in degrees)
+
+---
+
 ## Specification
 
 The decoder implements **EUROCONTROL-SPEC-0149-240** (*ASTERIX Category 240 — Video Transmission Standard*), edition 1.3.
@@ -165,9 +201,10 @@ Direct link to the CAT240 specification document:
 ## Project structure
 
 ```
-cat240_analyzer.py      Main tool: PPI + A-Scope visualiser
-cat240_stream_info.py   Stream statistics and Markdown report generator
-enviroment.sh           macOS/Linux virtual environment setup (Bash)
-requirements.txt        Python dependencies
-.python-version         Python version pin for pyenv (3.13.0)
+cat240_analyzer.py       Main tool: PPI + A-Scope visualiser
+cat240_stream_info.py    Stream statistics and report generator
+cat240_azimuth_check.py  Per-revolution azimuth completeness checker
+enviroment.sh            macOS/Linux virtual environment setup (Bash)
+requirements.txt         Python dependencies
+.python-version          Python version pin for pyenv (3.13.0)
 ```

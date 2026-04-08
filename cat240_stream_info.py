@@ -1404,6 +1404,17 @@ def main():
     args = parser.parse_args()
 
     import os
+    import glob as _glob
+
+    # On Windows the shell does not expand wildcards, so do it here.
+    expanded = []
+    for pattern in args.file:
+        matches = _glob.glob(pattern)
+        if matches:
+            expanded.extend(sorted(matches))
+        else:
+            expanded.append(pattern)   # keep as-is; FileNotFoundError will follow
+    args.file = expanded
 
     if len(args.file) > 1 and args.output:
         print("Warning: --output ignored when multiple files are given.", file=sys.stderr)
