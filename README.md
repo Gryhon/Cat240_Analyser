@@ -123,7 +123,7 @@ python cat240_analyzer.py --live --port 4379 --multicast 239.0.0.1 --host 192.16
 Scans one or more PCAP/PCAPNG files, auto-detects all CAT240 streams and prints detailed statistics (geometry, azimuth step, RPM, cell resolution, amplitude distribution). Also writes a Markdown report. Streams are sorted by source IP. Glob patterns work on all platforms (including Windows).
 
 ```bash
-# Full analysis, auto-generate <filename>_analysis.md:
+# Full analysis (terminal output only):
 python cat240_stream_info.py Data/recording.pcapng
 
 # Multiple files / glob pattern:
@@ -132,14 +132,20 @@ python cat240_stream_info.py Data/*.pcapng
 # Analyse only the first 10 000 UDP packets:
 python cat240_stream_info.py Data/recording.pcapng --packets 10000
 
-# Specify output path for the Markdown report (single file only):
-python cat240_stream_info.py Data/recording.pcapng --output report.md
+# Generate Markdown report (default path: <filename>_analysis.md):
+python cat240_stream_info.py Data/recording.pcapng --md
 
-# Also generate a PDF report (saved next to the Markdown file):
+# Markdown with custom path:
+python cat240_stream_info.py Data/recording.pcapng --md report.md
+
+# Generate PDF report:
 python cat240_stream_info.py Data/recording.pcapng --pdf
 
 # PDF with custom path:
 python cat240_stream_info.py Data/recording.pcapng --pdf report.pdf
+
+# Both Markdown and PDF in a subdirectory (created if missing):
+python cat240_stream_info.py Data/recording.pcapng --md --pdf --output-dir reports/
 ```
 
 The report includes per-stream:
@@ -151,38 +157,24 @@ The report includes per-stream:
 - FSPEC breakdown with active UAP items
 - Amplitude statistics and distribution histogram
 
----
+### `cat240_split_by_range.py` — Split PCAPNG by Range Scale
 
-### `cat240_azimuth_check.py` — Azimuth Completeness Check
-
-Analyses one or more PCAP/PCAPNG files and reports how many azimuths are missing per revolution. Only full revolutions (angular span ≥ 340°) are included; partial revolutions at recording start/end are counted separately and skipped. Streams are sorted by source IP. Glob patterns work on all platforms.
+Splits a PCAP/PCAPNG file into separate files, one per unique pulse length (CELL_DUR). Useful for isolating streams with different range scales (e.g. near-range, far-range modes) into individual files for separate analysis.
 
 ```bash
-# Full analysis, auto-generate <filename>_azcheck.md:
-python cat240_azimuth_check.py Data/recording.pcapng
+# Split into separate files by pulse length:
+python cat240_split_by_range.py Data/recording.pcapng
 
-# Multiple files / glob pattern:
-python cat240_azimuth_check.py Data/*.pcapng
-
-# Analyse only the first 10 000 UDP packets:
-python cat240_azimuth_check.py Data/recording.pcapng --packets 10000
-
-# Specify output path for the Markdown report (single file only):
-python cat240_azimuth_check.py Data/recording.pcapng --output report.md
-
-# Also generate a PDF report:
-python cat240_azimuth_check.py Data/recording.pcapng --pdf
-
-# PDF with custom path:
-python cat240_azimuth_check.py Data/recording.pcapng --pdf report.pdf
+# Write split files to a specific directory:
+python cat240_split_by_range.py Data/recording.pcapng --output-dir split_files/
 ```
 
-The report shows per stream:
-- Expected azimuths/revolution and median azimuth step
-- Number of full revolutions analysed (partial revolutions skipped)
-- Distribution: missing count → number of revolutions / percentage
-- Worst revolutions (index + timestamp)
-- Most frequently missing azimuth positions (in degrees)
+**Output example:**
+- `recording_12nm.pcapng` — Near-range mode (0.1448 µs pulse)
+- `recording_41nm.pcapng` — Mid-range mode (0.0618 µs pulse)
+- `recording_96nm.pcapng` — Far-range mode (1.1583 µs pulse)
+
+Each output file contains all packets (headers + data) and can be analyzed independently with `cat240_analyzer.py` or `cat240_stream_info.py`.
 
 ---
 
@@ -203,7 +195,7 @@ Direct link to the CAT240 specification document:
 ```
 cat240_analyzer.py       Main tool: PPI + A-Scope visualiser
 cat240_stream_info.py    Stream statistics and report generator
-cat240_azimuth_check.py  Per-revolution azimuth completeness checker
+cat240_split_by_range.py Split PCAPNG by pulse length (range scale)
 enviroment.sh            macOS/Linux virtual environment setup (Bash)
 requirements.txt         Python dependencies
 .python-version          Python version pin for pyenv (3.13.0)

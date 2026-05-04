@@ -413,6 +413,7 @@ class StreamStats:
         self.rev_max_gaps      = []     # Größte Lücke (°) pro vollständiger Revolution
         self._cur_rev_count    = 0      # Zähler für aktuelle Umdrehung
         self._cur_rev_spans    = []     # [(start_az, end_az)] der aktuellen Umdrehung
+        self._is_first_rev     = True   # erste Umdrehung in der Datei ist immer partial
         # Amplitude: sample data
         self.amp_min     = np.inf
         self.amp_max     = -np.inf
@@ -444,11 +445,15 @@ class StreamStats:
         if self._prev_az is not None:
             raw_d = msg.start_azimuth_deg - self._prev_az
             # Wrap-around = Umdrehungsgrenze erkannt (VOR der Normalisierung)
-            if raw_d < -180 and self._cur_rev_count > 10:
-                cov, gap = _compute_rev_coverage(self._cur_rev_spans)
-                self.rev_packet_counts.append(self._cur_rev_count)
-                self.rev_coverages.append(cov)
-                self.rev_max_gaps.append(gap)
+            if raw_d < -180:
+                if self._is_first_rev:
+                    # Erste Umdrehung immer verwerfen (ist immer partial am Dateistart)
+                    self._is_first_rev = False
+                elif self._cur_rev_count > 10:
+                    cov, gap = _compute_rev_coverage(self._cur_rev_spans)
+                    self.rev_packet_counts.append(self._cur_rev_count)
+                    self.rev_coverages.append(cov)
+                    self.rev_max_gaps.append(gap)
                 self._cur_rev_count = 0
                 self._cur_rev_spans = []
             # Normalisieren für Delta-Liste
@@ -611,15 +616,17 @@ def _compute_rev_coverage(spans):
     covered_sorted = sorted(covered_bins)
     max_gap_bins = 0
 
-    # Gaps zwischen consecutiven Bins
+    # Gaps zwischen consecutiven Bins (ignoriere Gaps ≤ 1 Bin = Quantisierungsartefakt)
+    GAP_THRESHOLD = 1  # Schwellenwert: Gaps ≤ 1 Bin ignorieren (≈ 0.0055°)
     for i in range(len(covered_sorted) - 1):
         gap_bins = covered_sorted[i + 1] - covered_sorted[i] - 1
-        if gap_bins > 0:
+        if gap_bins > GAP_THRESHOLD:
             max_gap_bins = max(max_gap_bins, gap_bins)
 
     # Wrap-around-Lücke (von letztem Bin bis zum ersten Bin + BINS)
     wrap_gap_bins = (covered_sorted[0] + BINS) - covered_sorted[-1] - 1
-    max_gap_bins = max(max_gap_bins, wrap_gap_bins)
+    if wrap_gap_bins > GAP_THRESHOLD:
+        max_gap_bins = max(max_gap_bins, wrap_gap_bins)
 
     max_gap_deg = max_gap_bins / BINS * 360.0
     return covered_deg, max_gap_deg
@@ -1096,9 +1103,8 @@ def print_report(filepath: str, streams: Dict[str, StreamStats],
             # Histogram
             if 'hist_arr' in amp:
                 arr = amp['hist_arr']
-                arr_norm = arr / arr.max() if arr.max() > 0 else arr
-                bins = np.linspace(0, 1, 9)
-                hist, edges = np.histogram(arr_norm, bins=bins)
+                bins = np.linspace(0, 255, 18)
+                hist, edges = np.histogram(arr, bins=bins)
                 bar_max = hist.max()
                 right.add_row("", "")
                 right.add_row("[bold magenta]── Amplitude distribution ──", "")
@@ -1115,13 +1121,16 @@ def print_report(filepath: str, streams: Dict[str, StreamStats],
     console.print()
     console.print(Panel(
         "[bold]How is Azimuths/revolution determined?[/]\n\n"
-        "Each CAT240 packet carries a start azimuth angle (0°–360°). "
-        "The analyzer records all azimuth positions in the order they arrive "
-        "and calculates the angular step between each consecutive pair of packets. "
-        "The [bold]median of all forward steps[/] (small positive jumps, ignoring "
-        "wrap-arounds and backwards steps) gives the typical beam spacing. "
-        "Dividing 360° by this median step yields the estimated number of azimuth "
-        "positions (spokes) per full antenna revolution.\n\n"
+        "[bold]Data collection:[/]\n"
+        "• Only complete antenna revolutions (first and last partials excluded)\n"
+        "• Per-revolution: START_AZ/END_AZ recorded for all packets\n\n"
+        "[bold]Per-revolution metrics:[/]\n"
+        "• Video headers/revolution: actual CAT240 packet count\n"
+        "• Azimuth coverage: % of 360° covered by packet spans\n"
+        "• Max gap: largest azimuth blind zone (gaps ≤ 0.0055° filtered)\n\n"
+        "[bold]Total azimuth resolution:[/]\n"
+        "• Angular step: median of forward jumps between consecutive packets\n"
+        "• Spoke count: 360° ÷ median step\n\n"
         "[dim]Example: median step = 0.0879°  →  360° ÷ 0.0879° ≈ 4096 spokes/rev[/]",
         title="[bold]Methodology[/]",
         border_style="dim",
@@ -1173,15 +1182,21 @@ def print_report_plain(filepath, streams, total_udp, non_cat240):
     print("─" * 60)
     print("Methodology — How is Azimuths/revolution determined?")
     print("─" * 60)
-    print(
-        "Each CAT240 packet carries a start azimuth angle (0–360 deg).\n"
-        "The analyzer records all azimuth positions in arrival order and\n"
-        "calculates the angular step between each consecutive pair of packets.\n"
-        "The median of all forward steps (small positive jumps) gives the\n"
-        "typical beam spacing. Dividing 360 deg by this median step yields\n"
-        "the estimated number of spokes per full antenna revolution.\n"
-        "Example: median step = 0.0879 deg  ->  360 / 0.0879 ~ 4096 spokes/rev"
-    )
+    print()
+    print("Data collection:")
+    print("  - Only complete antenna revolutions (first and last partials excluded)")
+    print("  - Per-revolution: START_AZ/END_AZ recorded for all packets")
+    print()
+    print("Per-revolution metrics:")
+    print("  - Video headers/revolution: actual CAT240 packet count")
+    print("  - Azimuth coverage: % of 360° covered by packet spans")
+    print("  - Max gap: largest azimuth blind zone (gaps ≤ 0.0055° filtered)")
+    print()
+    print("Total azimuth resolution:")
+    print("  - Angular step: median of forward jumps between consecutive packets")
+    print("  - Spoke count: 360° ÷ median step")
+    print()
+    print("Example: median step = 0.0879 deg  ->  360 / 0.0879 ~ 4096 spokes/rev")
     print()
 
 
@@ -1298,23 +1313,6 @@ def write_markdown(filepath: str, streams: Dict[str, StreamStats],
                 w(f"| Azimuth coverage | {cov_pct:.1f}%  (max gap: {az['gap_max_deg']:.3f}°) |")
         w()
 
-        # Step-size figure
-        try:
-            import os as _os
-            import matplotlib.pyplot as _plt
-            fig = _make_step_figure(s.net_key, _range_label(s), s)
-            if fig is not None:
-                md_base = _os.path.splitext(md_path)[0]
-                safe = s.net_key.replace(':', '_').replace('.', '_')
-                png_name = f"{_os.path.basename(md_base)}_stream{idx}_{safe}_steps.png"
-                png_path = _os.path.join(_os.path.dirname(md_path), png_name)
-                fig.savefig(png_path, dpi=150, bbox_inches='tight')
-                _plt.close(fig)
-                w(f"![Azimuth step size per revolution]({png_name})")
-                w()
-        except Exception:
-            pass
-
         w("### Azimuth — total recording")
         w()
         w("| Parameter | Value |")
@@ -1400,9 +1398,8 @@ def write_markdown(filepath: str, streams: Dict[str, StreamStats],
         # Histogram
         if amp and 'hist_arr' in amp:
             arr = amp['hist_arr']
-            arr_norm = arr / arr.max() if arr.max() > 0 else arr
-            bins = np.linspace(0, 1, 9)
-            hist, edges = np.histogram(arr_norm, bins=bins)
+            bins = np.linspace(0, 255, 18)
+            hist, edges = np.histogram(arr, bins=bins)
             w("#### Amplitude distribution")
             w()
             w("| Range | Count | Bar |")
@@ -1419,15 +1416,21 @@ def write_markdown(filepath: str, streams: Dict[str, StreamStats],
     w()
     w("### How is Azimuths/revolution determined?")
     w()
-    w(
-        "Each CAT240 packet carries a start azimuth angle (0°–360°). "
-        "The analyzer records all azimuth positions in the order they arrive "
-        "and calculates the angular step between each consecutive pair of packets. "
-        "The **median of all forward steps** (small positive jumps, ignoring "
-        "wrap-arounds and backwards steps) gives the typical beam spacing. "
-        "Dividing 360° by this median step yields the estimated number of azimuth "
-        "positions (spokes) per full antenna revolution."
-    )
+    w("**Data collection:**")
+    w("- Only complete antenna revolutions are analyzed (first and last partial revolutions are excluded)")
+    w("- For each complete revolution: start/end azimuths of all packets are recorded")
+    w()
+    w("**Per-revolution metrics:**")
+    w("- **Video headers/revolution:** Actual count of CAT240 packets per antenna rotation")
+    w("- **Azimuth coverage:** Percentage of 360° covered by START_AZ/END_AZ spans of packets")
+    w("- **Max gap:** Largest azimuth gap (blind zone) in each revolution")
+    w("  - Gaps ≤ 0.0055° are filtered (quantization artifact at 0°/360° boundary)")
+    w()
+    w("**Total azimuth resolution:")
+    w("- The analyzer calculates angular steps between consecutive packet azimuths")
+    w("- The **median of forward steps** (small positive jumps between consecutive packets)")
+    w("  gives the typical beam spacing")
+    w("- Dividing 360° by this median step yields the estimated spoke count")
     w()
     w("> **Example:** median step = 0.0879°  →  360° ÷ 0.0879° ≈ 4096 spokes/rev")
     w()
@@ -1698,22 +1701,6 @@ def write_pdf(filepath: str, streams: Dict[str, StreamStats],
             if az_rev_rows:
                 kv_table(az_rev_rows)
 
-            # Step-size figure
-            try:
-                import io as _io
-                import matplotlib.pyplot as _plt
-                fig = _make_step_figure(s.net_key, _range_label(s), s)
-                if fig is not None:
-                    _ensure_space(55)
-                    buf = _io.BytesIO()
-                    fig.savefig(buf, format='png', dpi=150, bbox_inches='tight')
-                    _plt.close(fig)
-                    buf.seek(0)
-                    pdf.image(buf, x=14, w=W)
-                    pdf.ln(2)
-            except Exception:
-                pass
-
             h3('Azimuth - total recording')
             az_tot_rows = [('Unique azimuths', str(az.get('unique', '?'))),
                            ('Az. min / max',
@@ -1783,8 +1770,7 @@ def write_pdf(filepath: str, streams: Dict[str, StreamStats],
         # Histogramm
         if amp and 'hist_arr' in amp:
             arr = amp['hist_arr']
-            arr_norm = arr / arr.max() if arr.max() > 0 else arr
-            hist, edges = np.histogram(arr_norm, bins=np.linspace(0, 1, 9))
+            hist, edges = np.histogram(arr, bins=np.linspace(0, 255, 18))
             bar_max = hist.max() or 1
             h3('Amplitude Distribution')
             ROW_H   = 5.0    # Zeilenhöhe mm
@@ -1830,17 +1816,35 @@ def write_pdf(filepath: str, streams: Dict[str, StreamStats],
     h2('How is Azimuths/revolution determined?')
     pdf.set_font('Helvetica', '', 9)
     pdf.set_text_color(*C_TEXT)
-    methodology_text = (
-        "Each CAT240 packet carries a start azimuth angle (0 deg - 360 deg). "
-        "The analyzer records all azimuth positions in the order they arrive "
-        "and calculates the angular step between each consecutive pair of packets. "
-        "The median of all forward steps (small positive jumps, ignoring "
-        "wrap-arounds and backwards steps) gives the typical beam spacing. "
-        "Dividing 360 deg by this median step yields the estimated number of "
-        "azimuth positions (spokes) per full antenna revolution."
-    )
-    pdf.multi_cell(W, 5, _s(methodology_text), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+    h3('Data Collection')
+    pdf.set_font('Helvetica', '', 8.5)
+    pdf.multi_cell(W, 4, _s(
+        "Only complete antenna revolutions are analyzed. The first (partial) "
+        "revolution at the file start and the last (partial) revolution at the file end "
+        "are excluded. For each complete revolution, start and end azimuths of all CAT240 "
+        "packets are recorded."
+    ), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(2)
+
+    h3('Per-Revolution Metrics')
+    pdf.set_font('Helvetica', '', 8.5)
+    pdf.multi_cell(W, 4, _s(
+        "Video headers/revolution: actual count of CAT240 packets per antenna rotation. "
+        "Azimuth coverage: percentage of 360° covered by packet start/end azimuths. "
+        "Max gap: largest azimuth blind zone (gaps ≤ 0.0055° are filtered as quantization artifacts)."
+    ), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(2)
+
+    h3('Total Azimuth Resolution')
+    pdf.set_font('Helvetica', '', 8.5)
+    pdf.multi_cell(W, 4, _s(
+        "Angular step between consecutive packets is calculated. The median of forward steps "
+        "(small positive jumps) gives the typical beam spacing. "
+        "Dividing 360° by this median step yields the estimated spoke count per revolution."
+    ), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.ln(3)
+
     pdf.set_font('Helvetica', 'I', 8.5)
     pdf.set_text_color(*C_DIM)
     pdf.cell(W, 5,

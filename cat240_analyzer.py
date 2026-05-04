@@ -342,6 +342,7 @@ class PcapReader:
         """Simplified PCAPNG reader (Section Header + Interface + Enhanced Packet)."""
         endian = '<'
         link_type = 1  # default Ethernet
+        ts_divisor = 1_000_000  # Standard: Mikrosekunden (if_tsresol fehlt → 10^6)
 
         while True:
             block_hdr = f.read(8)
@@ -358,14 +359,24 @@ class PcapReader:
                 if len(block_body) >= 4:
                     bom = struct.unpack('<I', block_body[:4])[0]
                     endian = '<' if bom == 0x1A2B3C4D else '>'
-            elif block_type == 0x00000001:  # Interface Description
+            elif block_type == 0x00000001:  # Interface Description Block
                 if len(block_body) >= 2:
                     link_type = struct.unpack(endian + 'H', block_body[:2])[0]
+                # if_tsresol (Option-Code 9) bestimmt die Timestamp-Auflösung
+                off = 8  # LinkType(2) + Reserved(2) + SnapLen(4) überspringen
+                while off + 4 <= len(block_body):
+                    opt_code, opt_len = struct.unpack(endian + 'HH', block_body[off:off + 4])
+                    if opt_code == 0:  # opt_endofopt
+                        break
+                    if opt_code == 9 and opt_len == 1:  # if_tsresol
+                        v = block_body[off + 4]
+                        ts_divisor = 2 ** (v & 0x7F) if (v & 0x80) else 10 ** v
+                    off += 4 + opt_len + ((-opt_len) % 4)  # auf 4 Byte padden
             elif block_type == 0x00000006:  # Enhanced Packet
                 if len(block_body) >= 20:
                     ts_high, ts_low, cap_len, orig_len = struct.unpack(
                         endian + 'IIII', block_body[4:20])
-                    timestamp = ((ts_high << 32) | ts_low) / 1e6
+                    timestamp = ((ts_high << 32) | ts_low) / ts_divisor
                     pkt_data = block_body[20:20 + cap_len]
                     result = self._extract_udp(pkt_data, link_type)
                     if result:
@@ -738,9 +749,9 @@ class AScope:
             self.ax2.tick_params(colors=self.LC_COLOR, labelsize=7)
             for spine in self.ax2.spines.values():
                 spine.set_edgecolor(self.LC_COLOR)
-            self.ax2.set_ylabel('Log-compressed (0–1)', fontsize=8,
+            self.ax2.set_ylabel('Log-compressed (0–255)', fontsize=8,
                                 color=self.LC_COLOR)
-            self.ax2.set_ylim(0, 1.1)
+            self.ax2.set_ylim(0, 255)
             self._line_lc, = self.ax2.plot([], [], color=self.LC_COLOR,
                                            linewidth=1.0, alpha=0.85,
                                            linestyle='--', label='log-compressed')
@@ -852,7 +863,7 @@ class AScope:
         self.ax.set_ylim(0, 255.0)
         if self._log_compress:
             self._estimate_p0()
-            lc = self._compress(cells) / 255.0
+            lc = self._compress(cells)
             self._line_lc.set_data(x, lc)
             self._line_lc.set_visible(self._show_log)
             if self._fill_lc is not None:
@@ -888,7 +899,7 @@ class AScope:
         self.ax.set_ylim(0, 255.0)
         if self._log_compress:
             self._estimate_p0()
-            lc = self._compress(ring) / 255.0
+            lc = self._compress(ring)
             self._line_lc.set_data(x, lc)
             self._line_lc.set_visible(self._show_log)
             if self._fill_lc is not None:
