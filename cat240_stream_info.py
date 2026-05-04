@@ -349,6 +349,7 @@ class PcapReader:
 
     def _read_pcapng(self, f):
         endian, link_type = '<', 1
+        ts_divisor = 1_000_000  # Standard: Mikrosekunden (if_tsresol fehlt → 10^6)
         while True:
             hdr = f.read(8)
             if len(hdr) < 8: break
@@ -364,11 +365,19 @@ class PcapReader:
             elif block_type == 0x00000001:
                 if len(body) >= 2:
                     link_type = struct.unpack(endian + 'H', body[:2])[0]
+                off = 8
+                while off + 4 <= len(body):
+                    opt_code, opt_len = struct.unpack(endian + 'HH', body[off:off + 4])
+                    if opt_code == 0: break
+                    if opt_code == 9 and opt_len == 1:
+                        v = body[off + 4]
+                        ts_divisor = 2 ** (v & 0x7F) if (v & 0x80) else 10 ** v
+                    off += 4 + opt_len + ((-opt_len) % 4)
             elif block_type == 0x00000006:
                 if len(body) >= 20:
                     ts_hi, ts_lo, cap_len, _ = struct.unpack(endian + 'IIII', body[4:20])
                     r = self._extract_udp(body[20:20 + cap_len], link_type)
-                    if r: yield ((ts_hi << 32) | ts_lo) / 1e6, r[0], r[1], r[2], r[3]
+                    if r: yield ((ts_hi << 32) | ts_lo) / ts_divisor, r[0], r[1], r[2], r[3]
             elif block_type == 0x00000003:
                 r = self._extract_udp(body[4:], link_type)
                 if r: yield 0.0, r[0], r[1], r[2], r[3]
@@ -381,8 +390,9 @@ class PcapReader:
 class StreamStats:
     """Collects all statistics for a single CAT240 stream."""
 
-    def __init__(self, key: str):
-        self.key         = key          # e.g. "239.0.0.1:5000"
+    def __init__(self, key: str, net_key: str = ''):
+        self.key         = key          # e.g. "239.0.0.1:5000|72393832"
+        self.net_key     = net_key or key  # IP:port part only, e.g. "239.0.0.1:5000"
         self.src_ips: set = set()       # source IP addresses observed
         self.sac_sic     = Counter()    # (sac, sic) → count
         self.msg_count   = 0
@@ -397,6 +407,12 @@ class StreamStats:
         self.az_deltas   = []
         self._prev_az    = None
         self.timestamps  = []
+        # Per-revolution statistics
+        self.rev_packet_counts = []     # Video-Header-Count pro vollständiger Revolution
+        self.rev_coverages     = []     # Coverage (°) pro vollständiger Revolution
+        self.rev_max_gaps      = []     # Größte Lücke (°) pro vollständiger Revolution
+        self._cur_rev_count    = 0      # Zähler für aktuelle Umdrehung
+        self._cur_rev_spans    = []     # [(start_az, end_az)] der aktuellen Umdrehung
         # Amplitude: sample data
         self.amp_min     = np.inf
         self.amp_max     = -np.inf
@@ -426,11 +442,26 @@ class StreamStats:
 
         self.azimuth_list.append(msg.start_azimuth_deg)
         if self._prev_az is not None:
-            d = msg.start_azimuth_deg - self._prev_az
+            raw_d = msg.start_azimuth_deg - self._prev_az
+            # Wrap-around = Umdrehungsgrenze erkannt (VOR der Normalisierung)
+            if raw_d < -180 and self._cur_rev_count > 10:
+                cov, gap = _compute_rev_coverage(self._cur_rev_spans)
+                self.rev_packet_counts.append(self._cur_rev_count)
+                self.rev_coverages.append(cov)
+                self.rev_max_gaps.append(gap)
+                self._cur_rev_count = 0
+                self._cur_rev_spans = []
+            # Normalisieren für Delta-Liste
+            d = raw_d
             if d < -180: d += 360
             if d >  180: d -= 360
             self.az_deltas.append(d)
         self._prev_az = msg.start_azimuth_deg
+        self._cur_rev_count += 1
+        # Normalisiere Azimuthe auf 0-360° (falls END_AZ > 360° über Wraparound hinausgeht)
+        start_az_norm = msg.start_azimuth_deg % 360.0
+        end_az_norm = msg.end_azimuth_deg % 360.0
+        self._cur_rev_spans.append((start_az_norm, end_az_norm))
 
         v = msg.video_data
         if v.size:
@@ -479,11 +510,12 @@ def analyse(filepath: str, max_packets: int = 0) -> Dict[str, StreamStats]:
                     continue
 
                 for msg in msgs:
-                    # Stream key: network level (dst IP:port)
-                    net_key = f"{dst_ip}:{dst_port}"
-                    if net_key not in streams:
-                        streams[net_key] = StreamStats(net_key)
-                    streams[net_key].add(msg, ts, src_ip)
+                    # Stream key: network endpoint + pulse length (CELL_DUR)
+                    net_key    = f"{dst_ip}:{dst_port}"
+                    stream_key = f"{net_key}|{msg.cell_duration_raw}"
+                    if stream_key not in streams:
+                        streams[stream_key] = StreamStats(stream_key, net_key=net_key)
+                    streams[stream_key].add(msg, ts, src_ip)
     else:
         for pkt_idx, (ts, payload, src_ip, dst_ip, dst_port) in enumerate(reader.packets()):
             if max_packets and pkt_idx >= max_packets:
@@ -497,10 +529,11 @@ def analyse(filepath: str, max_packets: int = 0) -> Dict[str, StreamStats]:
                     non_cat240 += 1
                 continue
             for msg in msgs:
-                net_key = f"{dst_ip}:{dst_port}"
-                if net_key not in streams:
-                    streams[net_key] = StreamStats(net_key)
-                streams[net_key].add(msg, ts, src_ip)
+                net_key    = f"{dst_ip}:{dst_port}"
+                stream_key = f"{net_key}|{msg.cell_duration_raw}"
+                if stream_key not in streams:
+                    streams[stream_key] = StreamStats(stream_key, net_key=net_key)
+                streams[stream_key].add(msg, ts, src_ip)
 
     return streams, total_udp, non_cat240
 
@@ -540,6 +573,58 @@ def _active_frns(fspec_hex: str) -> list:
     return frns
 
 
+def _compute_rev_coverage(spans):
+    """Berechnet Azimuth-Coverage und größte Lücke aus einer Liste von (start_az, end_az) Spans.
+    Gibt (covered_deg, max_gap_deg) zurück.
+    Nutzt diskretisierte 65536-Bin-Darstellung (native CAT240-Auflösung)."""
+    if not spans:
+        return 0.0, 360.0
+
+    BINS = 65536  # CAT240 native Auflösung (16-bit)
+    covered_bins = set()
+
+    for s, e in spans:
+        s_idx = int((s % 360.0) / 360.0 * BINS) % BINS
+        e_idx = int((e % 360.0) / 360.0 * BINS) % BINS
+        # Wenn s und e sehr nah beieinander sind (same bin), trotzdem beide einschließen
+        if s_idx == e_idx:
+            covered_bins.add(s_idx)
+        elif e_idx > s_idx:
+            covered_bins.update(range(s_idx, e_idx + 1))
+        else:  # Wraparound
+            covered_bins.update(range(s_idx, BINS))
+            covered_bins.update(range(0, e_idx + 1))
+
+    if not covered_bins:
+        return 0.0, 360.0
+
+    # Coverage berechnen
+    covered_deg = len(covered_bins) / BINS * 360.0
+
+    # Größte Lücke finden (auch nicht-abgedeckte Bereiche)
+    # Statt nur Gaps zwischen Spans zu suchen, suche die größte kontinuierliche Lücke
+    if len(covered_bins) == BINS:
+        # Alles abgedeckt
+        return covered_deg, 0.0
+
+    # Finde die größte kontinuierliche Lücke im Ring
+    covered_sorted = sorted(covered_bins)
+    max_gap_bins = 0
+
+    # Gaps zwischen consecutiven Bins
+    for i in range(len(covered_sorted) - 1):
+        gap_bins = covered_sorted[i + 1] - covered_sorted[i] - 1
+        if gap_bins > 0:
+            max_gap_bins = max(max_gap_bins, gap_bins)
+
+    # Wrap-around-Lücke (von letztem Bin bis zum ersten Bin + BINS)
+    wrap_gap_bins = (covered_sorted[0] + BINS) - covered_sorted[-1] - 1
+    max_gap_bins = max(max_gap_bins, wrap_gap_bins)
+
+    max_gap_deg = max_gap_bins / BINS * 360.0
+    return covered_deg, max_gap_deg
+
+
 def _az_stats(stats: StreamStats):
     """Computes azimuth statistics, returns dict."""
     r = {}
@@ -566,14 +651,223 @@ def _az_stats(stats: StreamStats):
         if len(delt_pos) > 10:
             step = np.median(delt_pos)
             r['spokes_per_rev'] = round(360.0 / step) if step > 0 else 0
+
+    # Per-revolution statistics
+    if stats.rev_packet_counts:
+        counts = stats.rev_packet_counts
+        r['hdr_min']    = int(np.min(counts))
+        r['hdr_median'] = int(np.median(counts))
+        r['hdr_max']    = int(np.max(counts))
+    if stats.rev_coverages:
+        r['cov_median_deg'] = float(np.median(stats.rev_coverages))
+        r['cov_min_deg']    = float(np.min(stats.rev_coverages))
+        r['gap_median_deg'] = float(np.median(stats.rev_max_gaps))
+        r['gap_max_deg']    = float(np.max(stats.rev_max_gaps))
     return r
 
 
+_MIN_REV_COVERAGE = 355.0   # Grad — Umdrehungen mit weniger Abdeckung werden verworfen
+
+def _step_matrix(stats: 'StreamStats'):
+    """Baut eine 2D-Matrix auf: matrix[umdrehung, azimut_bin] = Schrittgröße (°).
+    Nur vollständige Umdrehungen (>= 355° Abdeckung) werden berücksichtigt.
+    Die Binbreite wird aus dem Gesamt-Median der Vorwärtsschritte abgeleitet.
+    Gibt (matrix, rev_medians, rev_indices, bin_size_deg) zurück."""
+    if not stats.az_deltas or len(stats.azimuth_list) < 2:
+        return None, None, None, None
+
+    az_pos = np.array(stats.azimuth_list[:-1])
+    deltas = np.array(stats.az_deltas)
+
+    # Binbreite aus dem Median aller gültigen Vorwärtsschritte
+    valid_steps = deltas[(deltas > 0) & (deltas < 10)]
+    if valid_steps.size < 10:
+        return None, None, None, None
+    bin_size = float(np.median(valid_steps))
+    n_bins   = max(1, round(360.0 / bin_size))
+    bin_size = 360.0 / n_bins
+
+    # Umdrehungs-Index + Winkelabdeckung pro Umdrehung
+    cum = 0.0
+    rev = 0
+    rev_ids    = []
+    rev_coverage: dict = {}          # rev -> akkumulierte Grad
+    for d in deltas:
+        rev_ids.append(rev)
+        if 0 < d < 10:
+            rev_coverage[rev] = rev_coverage.get(rev, 0.0) + d
+            cum += d
+            if cum >= 360.0:
+                rev += 1
+                cum -= 360.0
+    n_revs_raw = rev + 1
+    if n_revs_raw < 2:
+        return None, None, None, None
+
+    # Nur vollständige Umdrehungen behalten
+    full_revs = [r for r in range(n_revs_raw)
+                 if rev_coverage.get(r, 0.0) >= _MIN_REV_COVERAGE]
+    if len(full_revs) < 2:
+        return None, None, None, None
+
+    full_set = set(full_revs)
+    n_revs   = len(full_revs)
+    rev_remap = {old: new for new, old in enumerate(full_revs)}
+
+    matrix = np.full((n_revs, n_bins), np.nan)
+    for d, az, r in zip(deltas, az_pos, rev_ids):
+        if 0 < d < 10 and r in full_set:
+            b  = int((az % 360.0) / bin_size) % n_bins
+            rr = rev_remap[r]
+            if np.isnan(matrix[rr, b]):
+                matrix[rr, b] = d
+            else:
+                matrix[rr, b] = (matrix[rr, b] + d) * 0.5
+
+    rev_medians = np.array([
+        float(np.nanmedian(matrix[r])) if not np.all(np.isnan(matrix[r])) else np.nan
+        for r in range(n_revs)
+    ])
+    return matrix, rev_medians, np.arange(n_revs), bin_size
+
+
+def _make_step_figure(net_key: str, cell_dur_label: str, stats: 'StreamStats'):
+    """Kombinierte Figure (vertikal gestapelt):
+    - Oben: Heatmap (Azimut × Umdrehung, Farbe = Schrittgröße), Y-Achse 1…N
+    - Unten: Mediankurve pro Umdrehung über Umdrehungs-Index
+    """
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        import matplotlib.colors as mcolors
+    except ImportError:
+        return None
+
+    matrix, rev_medians, rev_indices, bin_size = _step_matrix(stats)
+    if matrix is None or len(rev_indices) < 3:
+        return None
+
+    n_revs  = len(rev_indices)
+    n_bins  = matrix.shape[1]
+    overall_median = float(np.nanmedian(rev_medians))
+
+    # Farbskala: 2.–98. Perzentil der gültigen Werte; Mittelpunkt = Gesamtmedian
+    valid = matrix[~np.isnan(matrix)]
+    vmin = float(np.percentile(valid, 2))  if valid.size else 0
+    vmax = float(np.percentile(valid, 98)) if valid.size else 1
+    # Sicherstellen, dass overall_median strikt zwischen vmin und vmax liegt
+    vmin = min(vmin, overall_median * 0.95)
+    vmax = max(vmax, overall_median * 1.05)
+
+    # Divergierende Colormap: orange (niedrig) → weiß (Median) → rot (hoch)
+    cmap = mcolors.LinearSegmentedColormap.from_list(
+        'step_diverge',
+        [(0.0, '#FF7700'),   # orange  (Werte weit unter Median)
+         (0.5, '#FFFFFF'),   # weiß    (Werte am Median)
+         (1.0, '#CC0000')],  # rot     (Werte weit über Median)
+    )
+    cmap.set_bad('#d0d0d0')   # NaN = grau (kein Paket an dieser Position)
+    norm = mcolors.TwoSlopeNorm(vcenter=overall_median, vmin=vmin, vmax=vmax)
+
+    # Figurhöhe: skaliert mit Anzahl Umdrehungen, auf 3–9 Zoll begrenzt
+    fig_h = min(max(3.5, n_revs * 0.07), 9.0)
+    fig = plt.figure(figsize=(11, fig_h))
+    fig.suptitle(
+        f'{net_key}  ·  {cell_dur_label}  —  Azimuth step size'
+        f'  (bin = {bin_size:.4f}°,  {n_bins} spokes/rev)',
+        fontsize=9, y=1.01
+    )
+
+    gs = fig.add_gridspec(2, 1, height_ratios=[4, 1], hspace=0.12)
+    ax_heat = fig.add_subplot(gs[0])
+    ax_prof = fig.add_subplot(gs[1], sharex=None)
+
+    # ── Heatmap ──────────────────────────────────────────────────────────────
+    im = ax_heat.imshow(
+        matrix,
+        aspect='auto',
+        origin='upper',
+        extent=[0, 360, n_revs + 0.5, 0.5],   # Y-Achse: 1 … n_revs
+        cmap=cmap, norm=norm,
+        interpolation='nearest',
+    )
+    ax_heat.set_ylabel('Revolution', fontsize=8)
+    ax_heat.set_xlim(0, 360)
+    ax_heat.set_xticks(range(0, 361, 45))
+    ax_heat.tick_params(labelbottom=False, labelsize=7)   # X-Achse unten ausblenden
+
+    cb = fig.colorbar(im, ax=ax_heat, fraction=0.025, pad=0.01)
+    cb.set_label('Step size (°)', fontsize=7)
+    cb.ax.tick_params(labelsize=6)
+
+    # ── Median-Profil (unten, eigene X-Achse = Umdrehungs-Index 1…N) ─────────
+    rev_numbers = np.arange(1, n_revs + 1)
+    ax_prof.plot(rev_numbers, rev_medians,
+                 color='steelblue', linewidth=0.9)
+    ax_prof.axhline(overall_median, color='crimson', linewidth=0.8,
+                    linestyle='--', label=f'Overall median: {overall_median:.4f}°')
+    ax_prof.set_xlabel('Revolution', fontsize=8)
+    ax_prof.set_ylabel('Median\nstep (°)', fontsize=7)
+    ax_prof.set_xlim(1, n_revs)
+    ax_prof.set_ylim(bottom=0)
+    ax_prof.tick_params(labelsize=7)
+    ax_prof.legend(fontsize=6, loc='upper right')
+
+    fig.tight_layout(pad=0.5)
+    return fig
+
+
+def _ip_tuple(ip: str):
+    try:
+        return tuple(int(x) for x in ip.split('.'))
+    except ValueError:
+        return (0, 0, 0, 0)
+
+
 def _stream_sort_key(item):
-    """Sorts streams by src IP (numeric) then by stream key."""
-    key, s = item
-    ip = min(s.src_ips) if s.src_ips else '0.0.0.0'
-    return (tuple(int(x) for x in ip.split('.')), key)
+    """Sorts streams by src IP, then dst IP (unicast before multicast), then port, then CELL_DUR."""
+    _, s = item
+    src_ip  = min(s.src_ips) if s.src_ips else '0.0.0.0'
+    dst_ip, port = s.net_key.rsplit(':', 1)
+    crg = s.crg_counts.most_common(1)[0][0] if s.crg_counts else 0
+    dst_t = _ip_tuple(dst_ip)
+    is_multicast = 1 if 224 <= dst_t[0] <= 239 else 0
+    return (_ip_tuple(src_ip), dst_t, is_multicast, int(port), crg)
+
+
+def _range_label(stats: 'StreamStats') -> str:
+    """Stream-Label mit Pulslänge in µs, z.B. '0.5792 µs'."""
+    if not stats.crg_counts:
+        return '?'
+    crg = stats.crg_counts.most_common(1)[0][0]
+    scale = 1e-15 if stats.cell_dur_unit == 'fs' else 1e-9
+    cell_dur_us = crg * scale * 1e6
+    return f"{cell_dur_us:.4f} µs"
+
+
+def _multi_pulse_warnings(streams: Dict[str, 'StreamStats']) -> List[str]:
+    """Gibt Warnungen zurück, wenn ein Netzwerk-Stream mehrere Pulslängen nutzt."""
+    from collections import defaultdict
+    groups: Dict[str, List[str]] = defaultdict(list)
+    for key, s in streams.items():
+        groups[s.net_key].append(key)
+    warnings_out = []
+    for net_key in sorted(groups):
+        keys = groups[net_key]
+        if len(keys) > 1:
+            unit = streams[keys[0]].cell_dur_unit
+            scale = 1e-15 if unit == 'fs' else 1e-9
+            cds_us = sorted(
+                streams[k].crg_counts.most_common(1)[0][0] * scale * 1e6
+                for k in keys if streams[k].crg_counts
+            )
+            us_list = ', '.join(f"{v:.4f} µs" for v in cds_us)
+            warnings_out.append(
+                f"{net_key} uses {len(keys)} pulse lengths ({us_list}). "
+                f"Statistics are shown separately per pulse length below."
+            )
+    return warnings_out
 
 
 def _amp_stats(stats: StreamStats):
@@ -624,6 +918,17 @@ def print_report(filepath: str, streams: Dict[str, StreamStats],
         border_style="cyan",
     ))
 
+    # ── Multi-pulse-length warnings ─────────────────────────────────────────
+    pulse_warnings = _multi_pulse_warnings(streams)
+    if pulse_warnings:
+        console.print()
+        warn_text = "\n".join(f"[bold yellow]![/]  {w}" for w in pulse_warnings)
+        console.print(Panel(
+            warn_text,
+            title="[bold yellow]Multiple Pulse Lengths Detected[/]",
+            border_style="yellow",
+        ))
+
     # ── Overview table of all streams ───────────────────────────────────────
     console.print()
     overview = Table(
@@ -634,6 +939,7 @@ def print_report(filepath: str, streams: Dict[str, StreamStats],
     overview.add_column("#",             style="dim",    justify="right", width=3)
     overview.add_column("Src IP",        style="green",  min_width=15)
     overview.add_column("Dst IP:Port",   style="cyan",   min_width=20)
+    overview.add_column("CELL_DUR",       style="yellow", justify="right")
     overview.add_column("SAC / SIC",     style="yellow", justify="center")
     overview.add_column("Messages",      style="green",  justify="right")
     overview.add_column("Cells/az",      style="white",  justify="center")
@@ -656,7 +962,7 @@ def print_report(filepath: str, streams: Dict[str, StreamStats],
         fspec  = ", ".join(f"0x{f}" for f, _ in s.fspec_counts.most_common(2))
         src_ips_str = ", ".join(sorted(s.src_ips)) if s.src_ips else "?"
         overview.add_row(
-            str(idx), src_ips_str, key, sac_sic_str,
+            str(idx), src_ips_str, s.net_key, _range_label(s), sac_sic_str,
             f"{s.msg_count:,}", cells_str,
             bits_str, spokes, rpm, fspec,
         )
@@ -673,7 +979,7 @@ def print_report(filepath: str, streams: Dict[str, StreamStats],
         console.print(Panel(
             f"[dim]{s.msg_count:,} messages  ·  {dur_s:.1f} s  ·  "
             f"{s.msg_count/dur_s:.0f} msg/s[/]" if dur_s > 0 else "",
-            title=f"[bold cyan]Stream {idx}: {key}[/]",
+            title=f"[bold cyan]Stream {idx}: {s.net_key}  ·  {_range_label(s)}[/]",
             border_style="blue",
         ))
 
@@ -713,6 +1019,14 @@ def print_report(filepath: str, streams: Dict[str, StreamStats],
                              f"{az['step_median']:.4f}°")
                 left.add_row("Step size (min/max)",
                              f"{az['step_min']:.4f}° / {az['step_max']:.4f}°")
+            if 'hdr_median' in az:
+                left.add_row("Video headers/revolution",
+                             f"min={az['hdr_min']}  median={az['hdr_median']}  max={az['hdr_max']}")
+            if 'cov_median_deg' in az:
+                cov_pct = az['cov_median_deg'] / 360.0 * 100
+                color = 'green' if cov_pct >= 99.0 else 'yellow' if cov_pct >= 95.0 else 'red'
+                left.add_row("Azimuth coverage",
+                             f"[{color}]{cov_pct:.1f}%[/]  |  max gap: {az['gap_max_deg']:.3f}°")
 
         # Azimuth – total recording
         left.add_row("", "")
@@ -726,21 +1040,22 @@ def print_report(filepath: str, streams: Dict[str, StreamStats],
             if 'rpm_timestamps' in az:
                 left.add_row("RPM", f"{az['rpm_timestamps']:.1f}  [dim](from timestamps)[/]")
 
-        # CELL_DUR raw values
+        # CELL_DUR
         left.add_row("", "")
         unit_lbl = {'ns': 'I240/040 ns', 'fs': 'I240/041 fs'}.get(s.cell_dur_unit, '?')
         left.add_row("[bold magenta]── CELL_DUR (cell duration) ──", "")
         for crg, cnt in sorted(s.crg_counts.items()):
             pct = 100 * cnt / s.msg_count if s.msg_count else 0
             scale = 1e-15 if s.cell_dur_unit == 'fs' else 1e-9
+            cell_dur_us = crg * scale * 1e6
             range_m = 3e8 * (crg * scale) / 2.0
             total_cells = s.cell_counts.most_common(1)[0][0] if s.cell_counts else 0
             if crg > 0 and 0 < range_m < 1_000_000:
                 range_nm = range_m / 1852.0
-                note = f"{range_m:.2f} m/cell → ~{total_cells * range_nm:.0f} nm range  [{unit_lbl}]"
+                note = f"{range_m:.2f} m/cell → ~{total_cells * range_nm:.0f} nm range  [raw: {crg} {unit_lbl}]"
             else:
-                note = f"[{unit_lbl}]"
-            left.add_row(f"CELL_DUR = {crg}",
+                note = f"[raw: {crg} {unit_lbl}]"
+            left.add_row(f"CELL_DUR = {cell_dur_us:.4f} µs",
                          f"[dim]{cnt:,}× ({pct:.1f}%)  {note}[/]")
 
         # SAC/SIC
@@ -796,6 +1111,22 @@ def print_report(filepath: str, streams: Dict[str, StreamStats],
 
         console.print(Columns([left, right], equal=False, expand=True))
 
+    # ── Methodology note ─────────────────────────────────────────────────────
+    console.print()
+    console.print(Panel(
+        "[bold]How is Azimuths/revolution determined?[/]\n\n"
+        "Each CAT240 packet carries a start azimuth angle (0°–360°). "
+        "The analyzer records all azimuth positions in the order they arrive "
+        "and calculates the angular step between each consecutive pair of packets. "
+        "The [bold]median of all forward steps[/] (small positive jumps, ignoring "
+        "wrap-arounds and backwards steps) gives the typical beam spacing. "
+        "Dividing 360° by this median step yields the estimated number of azimuth "
+        "positions (spokes) per full antenna revolution.\n\n"
+        "[dim]Example: median step = 0.0879°  →  360° ÷ 0.0879° ≈ 4096 spokes/rev[/]",
+        title="[bold]Methodology[/]",
+        border_style="dim",
+    ))
+
     # ── Footer ───────────────────────────────────────────────────────────────
     console.print()
     if non_cat240:
@@ -810,11 +1141,13 @@ def print_report_plain(filepath, streams, total_udp, non_cat240):
     print(f"\n{sep}\nCAT240 ANALYSIS: {filepath}\n{sep}")
     print(f"UDP packets: {total_udp}  |  CAT240: {total_msgs}  |  Streams: {len(streams)}"
           + (f"  |  Non-CAT240: {non_cat240}" if non_cat240 else "") + "\n")
+    for w in _multi_pulse_warnings(streams):
+        print(f"WARNING: {w}")
     for key, s in sorted(streams.items(), key=_stream_sort_key):
         az = _az_stats(s)
         amp = _amp_stats(s)
         src_ips_str = ", ".join(sorted(s.src_ips)) if s.src_ips else "?"
-        print(f"\n[{key}]  src: {src_ips_str}  {s.msg_count:,} messages")
+        print(f"\n[{s.net_key}  {_range_label(s)}]  src: {src_ips_str}  {s.msg_count:,} messages")
         print(f"  SAC/SIC       : {dict(s.sac_sic.most_common(3))}")
         print(f"  Cells/azimuth : {dict(s.cell_counts.most_common())}")
         print(f"  Bit/cell      : {dict(s.cell_bits.most_common())}")
@@ -826,11 +1159,29 @@ def print_report_plain(filepath, streams, total_udp, non_cat240):
         print(f"  CELL_DUR raw  : {dict(s.crg_counts.most_common())}")
         if 'spokes_per_rev' in az:
             print(f"  Az/rev        : ~{az['spokes_per_rev']}")
+        if 'hdr_median' in az:
+            print(f"  Headers/rev   : min={az['hdr_min']}  median={az['hdr_median']}  max={az['hdr_max']}")
+        if 'cov_median_deg' in az:
+            cov_pct = az['cov_median_deg'] / 360.0 * 100
+            print(f"  Az coverage   : {cov_pct:.1f}%  (max gap: {az['gap_max_deg']:.3f}°)")
         if 'rpm_timestamps' in az:
             print(f"  RPM           : {az['rpm_timestamps']:.1f}  (from timestamps)")
         if amp:
             print(f"  Amp min/max   : {amp['min']:.0f} / {amp['max']:.0f}")
             print(f"  Zero fraction : {amp['zero_pct']:.1f}%")
+    print()
+    print("─" * 60)
+    print("Methodology — How is Azimuths/revolution determined?")
+    print("─" * 60)
+    print(
+        "Each CAT240 packet carries a start azimuth angle (0–360 deg).\n"
+        "The analyzer records all azimuth positions in arrival order and\n"
+        "calculates the angular step between each consecutive pair of packets.\n"
+        "The median of all forward steps (small positive jumps) gives the\n"
+        "typical beam spacing. Dividing 360 deg by this median step yields\n"
+        "the estimated number of spokes per full antenna revolution.\n"
+        "Example: median step = 0.0879 deg  ->  360 / 0.0879 ~ 4096 spokes/rev"
+    )
     print()
 
 
@@ -864,14 +1215,24 @@ def write_markdown(filepath: str, streams: Dict[str, StreamStats],
     if non_cat240:
         w(f"**Non-CAT240 UDP:** {non_cat240}")
     w()
+
+    # ── Multi-pulse-length warnings ──────────────────────────────────────────
+    pulse_warnings = _multi_pulse_warnings(streams)
+    if pulse_warnings:
+        w("> **Warning — Multiple Pulse Lengths Detected**")
+        for pw in pulse_warnings:
+            w(f">")
+            w(f"> - {pw}")
+        w()
+
     w("---")
     w()
 
     # ── Overview table ───────────────────────────────────────────────────────
     w("## Stream overview")
     w()
-    w("| # | Src IP | Dst IP:Port | SAC/SIC | Messages | Cells/az | Bit/cell | Az/rev | RPM | FSPEC |")
-    w("|---|---|---|---|---|---|---|---|---|---|")
+    w("| # | Src IP | Dst IP:Port | CELL_DUR | SAC/SIC | Messages | Cells/az | Bit/cell | Az/rev | RPM | FSPEC |")
+    w("|---|---|---|---|---|---|---|---|---|---|---|")
     for idx, (key, s) in enumerate(sorted(streams.items(), key=_stream_sort_key), 1):
         az  = _az_stats(s)
         sac_sic = ", ".join(f"{a}/{b}" for (a,b),_ in s.sac_sic.most_common(2))
@@ -881,7 +1242,7 @@ def write_markdown(filepath: str, streams: Dict[str, StreamStats],
         rpm = f"{az['rpm_timestamps']:.1f}" if 'rpm_timestamps' in az else '?'
         fspec = ", ".join(f"`0x{f}`" for f,_ in s.fspec_counts.most_common(2))
         src_ips_str = ", ".join(sorted(s.src_ips)) if s.src_ips else "?"
-        w(f"| {idx} | {src_ips_str} | `{key}` | {sac_sic} | {s.msg_count:,} | {cells} | {bits} | {spokes} | {rpm} | {fspec} |")
+        w(f"| {idx} | {src_ips_str} | `{s.net_key}` | {_range_label(s)} | {sac_sic} | {s.msg_count:,} | {cells} | {bits} | {spokes} | {rpm} | {fspec} |")
     w()
 
     # ── Per-stream detail ────────────────────────────────────────────────────
@@ -893,7 +1254,7 @@ def write_markdown(filepath: str, streams: Dict[str, StreamStats],
         if idx > 1:
             w('<div style="page-break-before: always"></div>')
             w()
-        w(f"## Stream {idx}: `{key}`")
+        w(f"## Stream {idx}: `{s.net_key}`  ·  {_range_label(s)}")
         w()
         w(f"{s.msg_count:,} messages · {dur_s:.1f} s · "
           + (f"{s.msg_count/dur_s:.0f} msg/s" if dur_s > 0 else ""))
@@ -930,7 +1291,30 @@ def write_markdown(filepath: str, streams: Dict[str, StreamStats],
             if 'step_median' in az:
                 w(f"| Step size (median) | {az['step_median']:.4f}° |")
                 w(f"| Step size (min/max) | {az['step_min']:.4f}° / {az['step_max']:.4f}° |")
+            if 'hdr_median' in az:
+                w(f"| Video headers/revolution | min={az['hdr_min']} / median={az['hdr_median']} / max={az['hdr_max']} |")
+            if 'cov_median_deg' in az:
+                cov_pct = az['cov_median_deg'] / 360.0 * 100
+                w(f"| Azimuth coverage | {cov_pct:.1f}%  (max gap: {az['gap_max_deg']:.3f}°) |")
         w()
+
+        # Step-size figure
+        try:
+            import os as _os
+            import matplotlib.pyplot as _plt
+            fig = _make_step_figure(s.net_key, _range_label(s), s)
+            if fig is not None:
+                md_base = _os.path.splitext(md_path)[0]
+                safe = s.net_key.replace(':', '_').replace('.', '_')
+                png_name = f"{_os.path.basename(md_base)}_stream{idx}_{safe}_steps.png"
+                png_path = _os.path.join(_os.path.dirname(md_path), png_name)
+                fig.savefig(png_path, dpi=150, bbox_inches='tight')
+                _plt.close(fig)
+                w(f"![Azimuth step size per revolution]({png_name})")
+                w()
+        except Exception:
+            pass
+
         w("### Azimuth — total recording")
         w()
         w("| Parameter | Value |")
@@ -945,20 +1329,21 @@ def write_markdown(filepath: str, streams: Dict[str, StreamStats],
         w()
 
         # CELL_DUR
-        unit_lbl = {'ns': 'I240/040 nanoseconds', 'fs': 'I240/041 femtoseconds'}.get(s.cell_dur_unit, '?')
-        w(f"### CELL_DUR (cell duration, {unit_lbl})")
+        unit_lbl = {'ns': 'I240/040 ns', 'fs': 'I240/041 fs'}.get(s.cell_dur_unit, '?')
+        w(f"### CELL_DUR (cell duration)")
         w()
-        w("| CELL_DUR value | Messages | Note |")
-        w("|---|---|---|")
+        w("| CELL_DUR (µs) | Raw value | Messages | Note |")
+        w("|---|---|---|---|")
         for crg, cnt in sorted(s.crg_counts.items()):
             scale = 1e-15 if s.cell_dur_unit == 'fs' else 1e-9
+            cell_dur_us = crg * scale * 1e6
             range_m = 3e8 * (crg * scale) / 2.0
             total_cells = s.cell_counts.most_common(1)[0][0] if s.cell_counts else 0
             if crg > 0 and 0 < range_m < 1_000_000:
                 note = f"{range_m:.2f} m/cell → ~{total_cells * range_m / 1852:.0f} nm range"
             else:
-                note = f"[{unit_lbl}]"
-            w(f"| {crg} | {cnt:,} | {note} |")
+                note = ""
+            w(f"| {cell_dur_us:.4f} µs | {crg} {unit_lbl} | {cnt:,} | {note} |")
         w()
 
         # Data source
@@ -1028,6 +1413,24 @@ def write_markdown(filepath: str, streams: Dict[str, StreamStats],
                 w(f"| {edges[i]:.2f}–{edges[i+1]:.2f} | {hist[i]:,} | {bar} |")
             w()
 
+    w("---")
+    w()
+    w("## Methodology")
+    w()
+    w("### How is Azimuths/revolution determined?")
+    w()
+    w(
+        "Each CAT240 packet carries a start azimuth angle (0°–360°). "
+        "The analyzer records all azimuth positions in the order they arrive "
+        "and calculates the angular step between each consecutive pair of packets. "
+        "The **median of all forward steps** (small positive jumps, ignoring "
+        "wrap-arounds and backwards steps) gives the typical beam spacing. "
+        "Dividing 360° by this median step yields the estimated number of azimuth "
+        "positions (spokes) per full antenna revolution."
+    )
+    w()
+    w("> **Example:** median step = 0.0879°  →  360° ÷ 0.0879° ≈ 4096 spokes/rev")
+    w()
     w("---")
     w()
     w(f"*Generated by cat240_stream_info.py*")
@@ -1201,11 +1604,32 @@ def write_pdf(filepath: str, streams: Dict[str, StreamStats],
         ('Non-CAT240 UDP',     str(non_cat240) if non_cat240 else '0'),
     ])
 
+    # ── Multi-pulse-length warnings ───────────────────────────────────────────
+    pulse_warnings = _multi_pulse_warnings(streams)
+    if pulse_warnings:
+        C_WARN_BG  = (255, 248, 220)
+        C_WARN_BOR = (200, 150,  50)
+        _ensure_space(8 + len(pulse_warnings) * 6)
+        pdf.set_fill_color(*C_WARN_BG)
+        pdf.set_draw_color(*C_WARN_BOR)
+        pdf.set_line_width(0.5)
+        pdf.set_font('Helvetica', 'B', 8.5)
+        pdf.set_text_color(140, 80, 0)
+        pdf.cell(W, 6, 'Warning - Multiple Pulse Lengths Detected', border=1, fill=True,
+                 new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.set_font('Helvetica', '', 8)
+        for pw in pulse_warnings:
+            pdf.set_fill_color(*C_WARN_BG)
+            pdf.cell(W, 5, _s(pw), border=0, fill=True,
+                     new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.set_text_color(*C_TEXT)
+        pdf.ln(3)
+
     # ── Stream-Übersicht ──────────────────────────────────────────────────────
     h2('Stream Overview')
-    hdrs = ['#', 'Src IP', 'Dst IP:Port', 'SAC/SIC', 'Messages',
+    hdrs = ['#', 'Src IP', 'Dst IP:Port', 'CELL_DUR', 'SAC/SIC', 'Messages',
             'Cells/az', 'Bit/cell', 'Az/rev', 'RPM', 'FSPEC']
-    cws  = [7, 32, 38, 18, 20, 16, 14, 14, 12, 25]
+    cws  = [7, 28, 33, 16, 18, 18, 14, 12, 12, 10, 22]
     rows_ov = []
     for idx, (key, s) in enumerate(sorted(streams.items(), key=_stream_sort_key), 1):
         az  = _az_stats(s)
@@ -1216,8 +1640,8 @@ def write_pdf(filepath: str, streams: Dict[str, StreamStats],
         rpm     = f"{az['rpm_timestamps']:.1f}" if 'rpm_timestamps' in az else '?'
         fspec   = ', '.join(f"0x{f}" for f, _ in s.fspec_counts.most_common(2))
         src_ips_str = ', '.join(sorted(s.src_ips)) if s.src_ips else '?'
-        rows_ov.append([str(idx), src_ips_str, key, sac_sic, f'{s.msg_count:,}',
-                        cells, bits, spokes, rpm, fspec])
+        rows_ov.append([str(idx), src_ips_str, s.net_key, _range_label(s), sac_sic,
+                        f'{s.msg_count:,}', cells, bits, spokes, rpm, fspec])
     wide_table(hdrs, rows_ov, cws)
 
     # ── Pro-Stream-Details ────────────────────────────────────────────────────
@@ -1228,7 +1652,7 @@ def write_pdf(filepath: str, streams: Dict[str, StreamStats],
 
         if idx > 1:
             pdf.add_page()
-        h2(f'Stream {idx}: {key}')
+        h2(f'Stream {idx}: {s.net_key}  -  {_range_label(s)}')
         pdf.set_font('Helvetica', '', 8)
         pdf.set_text_color(*C_DIM)
         rate = f'  -  {s.msg_count / dur_s:.0f} msg/s' if dur_s > 0 else ''
@@ -1264,8 +1688,31 @@ def write_pdf(filepath: str, streams: Dict[str, StreamStats],
                 az_rev_rows.append(('Step size (median)', f"{az['step_median']:.4f}°"))
                 az_rev_rows.append(('Step size (min/max)',
                                     f"{az['step_min']:.4f}° / {az['step_max']:.4f}°"))
+            if 'hdr_median' in az:
+                az_rev_rows.append(('Video headers/revolution',
+                                    f"min={az['hdr_min']}  median={az['hdr_median']}  max={az['hdr_max']}"))
+            if 'cov_median_deg' in az:
+                cov_pct = az['cov_median_deg'] / 360.0 * 100
+                az_rev_rows.append(('Azimuth coverage',
+                                    f"{cov_pct:.1f}%  (max gap: {az['gap_max_deg']:.3f}°)"))
             if az_rev_rows:
                 kv_table(az_rev_rows)
+
+            # Step-size figure
+            try:
+                import io as _io
+                import matplotlib.pyplot as _plt
+                fig = _make_step_figure(s.net_key, _range_label(s), s)
+                if fig is not None:
+                    _ensure_space(55)
+                    buf = _io.BytesIO()
+                    fig.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+                    _plt.close(fig)
+                    buf.seek(0)
+                    pdf.image(buf, x=14, w=W)
+                    pdf.ln(2)
+            except Exception:
+                pass
 
             h3('Azimuth - total recording')
             az_tot_rows = [('Unique azimuths', str(az.get('unique', '?'))),
@@ -1278,21 +1725,21 @@ def write_pdf(filepath: str, streams: Dict[str, StreamStats],
             kv_table(az_tot_rows)
 
         # CELL_DUR
-        unit_lbl = {'ns': 'I240/040 nanoseconds',
-                    'fs': 'I240/041 femtoseconds'}.get(s.cell_dur_unit, '?')
-        h3(f'CELL_DUR ({unit_lbl})')
+        unit_lbl = {'ns': 'I240/040 ns', 'fs': 'I240/041 fs'}.get(s.cell_dur_unit, '?')
+        h3('CELL_DUR (cell duration)')
         scale = 1e-15 if s.cell_dur_unit == 'fs' else 1e-9
         total_cells = s.cell_counts.most_common(1)[0][0] if s.cell_counts else 0
         cd_rows = []
         for crg, cnt in sorted(s.crg_counts.items()):
             pct = 100 * cnt / s.msg_count if s.msg_count else 0
+            cell_dur_us = crg * scale * 1e6
             range_m = 3e8 * (crg * scale) / 2.0
             if crg > 0 and 0 < range_m < 1_000_000:
-                note = f"{range_m:.2f} m/cell  →  ~{total_cells * range_m / 1852:.0f} nm range"
+                note = f"{range_m:.2f} m/cell  ->  ~{total_cells * range_m / 1852:.0f} nm range"
             else:
                 note = ''
-            cd_rows.append((str(crg), f'{cnt:,}  ({pct:.1f}%)', note))
-        wide_table(['CELL_DUR value', 'Messages', 'Note'], cd_rows, [35, 40, 107])
+            cd_rows.append((f'{cell_dur_us:.4f} us', f'{crg} {unit_lbl}', f'{cnt:,}  ({pct:.1f}%)', note))
+        wide_table(['CELL_DUR (µs)', 'Raw value', 'Messages', 'Note'], cd_rows, [30, 38, 32, 82])
 
         # Data source / FSPEC
         h3('Data Source & FSPEC')
@@ -1377,6 +1824,30 @@ def write_pdf(filepath: str, streams: Dict[str, StreamStats],
                     pdf.set_fill_color(*(C_ROW_EVEN if i % 2 == 0 else C_ROW_ODD))
             pdf.ln(2)
 
+    # ── Methodology note ─────────────────────────────────────────────────────
+    pdf.add_page()
+    h1('Methodology')
+    h2('How is Azimuths/revolution determined?')
+    pdf.set_font('Helvetica', '', 9)
+    pdf.set_text_color(*C_TEXT)
+    methodology_text = (
+        "Each CAT240 packet carries a start azimuth angle (0 deg - 360 deg). "
+        "The analyzer records all azimuth positions in the order they arrive "
+        "and calculates the angular step between each consecutive pair of packets. "
+        "The median of all forward steps (small positive jumps, ignoring "
+        "wrap-arounds and backwards steps) gives the typical beam spacing. "
+        "Dividing 360 deg by this median step yields the estimated number of "
+        "azimuth positions (spokes) per full antenna revolution."
+    )
+    pdf.multi_cell(W, 5, _s(methodology_text), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(3)
+    pdf.set_font('Helvetica', 'I', 8.5)
+    pdf.set_text_color(*C_DIM)
+    pdf.cell(W, 5,
+             _s('Example: median step = 0.0879 deg  ->  360 deg / 0.0879 deg ~ 4096 spokes/rev'),
+             new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.set_text_color(*C_TEXT)
+
     pdf.output(pdf_path)
 
 
@@ -1394,17 +1865,22 @@ def main():
         help="Analyse only the first N UDP packets (0 = all)"
     )
     parser.add_argument(
-        "--output", "-o", metavar="FILE.md",
-        help="Path for Markdown output (only used when a single file is given; default: <input>_analysis.md)"
+        "--md", metavar="FILE.md", nargs="?", const="",
+        help="Generate a Markdown report (default path: <input>_analysis.md)"
     )
     parser.add_argument(
         "--pdf", metavar="FILE.pdf", nargs="?", const="",
-        help="Also generate a PDF report (default path: <input>_analysis.pdf)"
+        help="Generate a PDF report (default path: <input>_analysis.pdf)"
+    )
+    parser.add_argument(
+        "--output-dir", "-d", metavar="DIR",
+        help="Directory for auto-generated output files (created if missing; default: current directory)"
     )
     args = parser.parse_args()
 
     import os
     import glob as _glob
+    from pathlib import Path
 
     # On Windows the shell does not expand wildcards, so do it here.
     expanded = []
@@ -1416,18 +1892,14 @@ def main():
             expanded.append(pattern)   # keep as-is; FileNotFoundError will follow
     args.file = expanded
 
-    if len(args.file) > 1 and args.output:
-        print("Warning: --output ignored when multiple files are given.", file=sys.stderr)
+    outdir = Path(args.output_dir) if args.output_dir else Path(".")
+    outdir.mkdir(parents=True, exist_ok=True)
 
     exit_code = 0
     for filepath in args.file:
         base = os.path.splitext(os.path.basename(filepath))[0]
-        if len(args.file) == 1:
-            md_path  = args.output if args.output else f"{base}_analysis.md"
-            pdf_path = (args.pdf if args.pdf else f"{base}_analysis.pdf") if args.pdf is not None else None
-        else:
-            md_path  = f"{base}_analysis.md"
-            pdf_path = f"{base}_analysis.pdf" if args.pdf is not None else None
+        md_path  = (args.md  if args.md  else str(outdir / f"{base}_analysis.md"))  if args.md  is not None else None
+        pdf_path = (args.pdf if args.pdf else str(outdir / f"{base}_analysis.pdf")) if args.pdf is not None else None
 
         if RICH and len(args.file) > 1:
             console.rule(f"[bold]{filepath}")
@@ -1445,11 +1917,12 @@ def main():
             else:
                 print_report_plain(filepath, streams, total_udp, non_cat240)
 
-            write_markdown(filepath, streams, total_udp, non_cat240, md_path=md_path)
-            if RICH:
-                console.print(f"[dim]Markdown saved: [cyan]{md_path}[/][/]")
-            else:
-                print(f"Markdown saved: {md_path}")
+            if md_path is not None:
+                write_markdown(filepath, streams, total_udp, non_cat240, md_path=md_path)
+                if RICH:
+                    console.print(f"[dim]Markdown saved: [cyan]{md_path}[/][/]")
+                else:
+                    print(f"Markdown saved: {md_path}")
 
             if pdf_path is not None:
                 write_pdf(filepath, streams, total_udp, non_cat240, pdf_path)
