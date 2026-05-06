@@ -72,7 +72,46 @@ python cat240_analyzer.py --live --port 4379 --multicast 239.0.0.1
 
 # Multicast on a specific interface:
 python cat240_analyzer.py --live --port 4379 --multicast 239.0.0.1 --host 192.168.1.10
+
+# From JSON configuration:
+python cat240_analyzer.py --config config_live_example.json
 ```
+
+#### Configuration from JSON
+
+All options can be specified in a JSON configuration file. Useful for complex or repeated setups:
+
+```bash
+# Load configuration from JSON
+python cat240_analyzer.py --config my_config.json
+
+# Command-line arguments take precedence over JSON
+python cat240_analyzer.py --config my_config.json --speed 20
+```
+
+**JSON file format:**
+
+```json
+{
+  "replay": "Data/recording.pcapng",
+  "speed": 1.0,
+  "loop": false,
+  "stream": null,
+  "no_filter": false,
+  "log_compress": true,
+  "interpolate": false,
+  "sweepline": false,
+  "waterfall": true
+}
+```
+
+**Supported keys:**
+- **Mode:** `replay` (file path), `live` (boolean)
+- **Replay:** `speed` (float), `loop` (boolean), `stream` (IP:PORT or null), `no_filter` (boolean)
+- **Live:** `port` (number), `host` (IP address), `multicast` (IP or null)
+- **Display:** `log_compress`, `interpolate`, `sweepline`, `waterfall` (all boolean)
+
+See `config_example.json` (replay) and `config_live_example.json` (live) for complete examples.
 
 #### Live options
 
@@ -96,8 +135,18 @@ python cat240_analyzer.py --live --port 4379 --multicast 239.0.0.1 --host 192.16
 | Option | Description |
 |---|---|
 | `--log-compress` | Add soft-log overlay to A-Scope (second Y-axis, 0–255) |
+| `--interpolate` | Interpolate missing azimuths in gaps (for imperfect network data) |
+| `--sweepline` | Show rotating yellow line indicating current azimuth |
+| `--waterfall` | Show waterfall display (range vs. azimuth, black background) — useful for spotting gaps |
 
-#### PPI buttons
+#### PPI display
+
+**Window title** shows:
+- Message count (`N msgs`)
+- Coverage percentage (`XX.X% coverage`) — percentage of azimuths with data
+- Range scale resets (if any)
+
+**Buttons:**
 
 | Button | Effect |
 |---|---|
@@ -115,6 +164,38 @@ python cat240_analyzer.py --live --port 4379 --multicast 239.0.0.1 --host 192.16
 | Scroll wheel in PPI | Zoom in / out centred on cursor |
 | Double-click in PPI | Reset zoom to full range |
 | Mouse over A-Scope | Measurement cursor with cell number and amplitude |
+
+#### Waterfall display
+
+When `--waterfall` is enabled, a second window shows a **range-vs-azimuth** display:
+- **X-axis:** Azimuths (0° to 360°)  
+- **Y-axis:** Range cells (0 to maximum)  
+- **Background:** Black  
+- **Echoes:** Colored using the same colormap as the PPI (plasma by default)
+
+**Purpose:** Spot missing azimuths (gaps appear as black vertical lines) and verify continuous coverage across the full revolution.
+
+**Waterfall buttons and controls:**
+
+| Button | Effect |
+|---|---|
+| `Pause` / `Play` | Pause or resume playback (synchronized with PPI) |
+| `Zoom` | Activate rectangle zoom — drag to select area. When active, mouse drag creates a zoom rectangle |
+
+**Interactions:**
+- **Scroll wheel** — Zoom in/out centred on cursor position (works when Zoom mode inactive)
+- **Double-click** — Reset zoom to full 0–360° azimuth range
+
+#### Azimuth coverage & interpolation
+
+The PPI grid has 4096 azimuth bins covering 360°. Each incoming CAT240 message specifies a **START_AZ** and **END_AZ** azimuth range; the entire range is filled to eliminate artificial gaps.
+
+**Coverage percentage** (displayed in window title) shows what fraction of the 4096 bins contain data:
+- **≥99%** — No visible gaps; normal operation
+- **95–99%** — Minor gaps possible; usually acceptable  
+- **<95%** — Significant data loss in the network stream
+
+Use `--interpolate` to automatically fill gaps with data from the previous revolution. This smooths the image for imperfect network data.
 
 ---
 

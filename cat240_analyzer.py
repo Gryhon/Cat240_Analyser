@@ -470,14 +470,20 @@ class RadarPPI:
     Accumulates CAT240 azimuths and renders them as a polar image.
     """
 
-    def __init__(self, max_range_cells: int = 512, az_bins: int = 4096):
+    def __init__(self, max_range_cells: int = 512, az_bins: int = 4096, interpolate_gaps: bool = False, show_sweepline: bool = False):
+        from collections import deque
         self.max_range_cells = max_range_cells
         self.az_bins         = az_bins
+        self.interpolate_gaps = interpolate_gaps
+        self.show_sweepline = show_sweepline
         # Polar accumulation grid: [azimuth bins x range cells]
         self.grid = np.zeros((az_bins, max_range_cells), dtype=np.float32)
         self._lock = threading.Lock()
         self._msg_count  = 0
         self._spoke_count = defaultdict(int)
+        # Ring-Buffer: letzte ~10 Umdrehungen als (az_center_deg, cells, start_range_cell)
+        self._az_buffer = deque()
+        self._az_buffer_maxlen = 10 * az_bins  # ~10 Umdrehungen
         # Pre-compute meshgrid once (polar → Cartesian)
         az_rad = np.linspace(0, 2 * np.pi, az_bins, endpoint=False)
         r      = np.arange(max_range_cells)
@@ -498,9 +504,17 @@ class RadarPPI:
         self._dirty       = False
         self._vmax_cached = 0.0
         self._grid_render = np.zeros((az_bins, max_range_cells), dtype=np.float32)
+        # Gap detection & interpolation
+        self._prev_az_idx = None
+        self._prev_rev_grid = None  # Track which bins were filled in last revolution
+        self._empty_bins_per_rev = []  # Count of bins with no data per revolution
+        self._current_rev_filled_bins = set()  # Bins filled in current revolution
+        # Sweepline: track latest azimuth
+        self._last_az_deg = 0.0  # Latest azimuth in degrees
+        self._sweepline = None  # matplotlib line object for sweepline
 
     def add_message(self, msg: Cat240Message):
-        """Inserts a CAT240 azimuth into the PPI grid."""
+        """Inserts a CAT240 azimuth range (START_AZ to END_AZ) into the PPI grid."""
         with self._lock:
             # Range-Wechsel erkennen: cell_duration_ns hat sich um mehr als 1% geändert
             if msg.cell_duration_ns > 0:
@@ -514,9 +528,22 @@ class RadarPPI:
                     self._cell_duration_ns = msg.cell_duration_ns
                     self.cell_size_m = 299_792_458.0 * msg.cell_duration_ns * 1e-9 / 2.0
                     self.range_resets += 1
+                    self._prev_az_idx = None
+                    self._prev_rev_grid = None
+                    self._empty_bins_per_rev = []
+                    self._current_rev_filled_bins = set()
 
-            az_center = (msg.start_azimuth_deg + msg.end_azimuth_deg) / 2.0
-            az_idx = int((az_center / 360.0) * self.az_bins) % self.az_bins
+            # Convert start and end azimuths to bin indices
+            az_start_idx = round((msg.start_azimuth_deg / 360.0) * self.az_bins) % self.az_bins
+            az_end_idx = round((msg.end_azimuth_deg / 360.0) * self.az_bins) % self.az_bins
+
+            # Fill all bins from start to end (handles wrap-around at 360°)
+            if az_start_idx <= az_end_idx:
+                bin_indices = np.arange(az_start_idx, az_end_idx + 1)
+            else:
+                # Wrap-around case (crosses 360°)
+                bin_indices = np.concatenate([np.arange(az_start_idx, self.az_bins),
+                                              np.arange(0, az_end_idx + 1)])
 
             cells = msg.video_data
             n = min(len(cells), self.max_range_cells - msg.start_range_cell)
@@ -527,12 +554,42 @@ class RadarPPI:
             if r_end > self.max_range_cells:
                 r_end = self.max_range_cells
                 n = r_end - r_start
-            self.grid[az_idx, r_start:r_end] = cells[:n]
+
+            # Fill all bins in the azimuth range with the same cell data
+            for bin_idx in bin_indices:
+                self.grid[bin_idx, r_start:r_end] = cells[:n]
+                self._current_rev_filled_bins.add(bin_idx)
+
+            # Detect revolution wrap-around (when azimuth goes backward)
+            if self._prev_az_idx is not None and az_start_idx < self._prev_az_idx:
+                # End of revolution: count empty bins
+                empty_count = self.az_bins - len(self._current_rev_filled_bins)
+                self._empty_bins_per_rev.append(empty_count)
+                self._current_rev_filled_bins.clear()
+
+                # Optional: interpolate gaps from previous revolution
+                if self.interpolate_gaps and self._prev_rev_grid is not None:
+                    empty_bins_list = [i for i in range(self.az_bins) if i not in self._current_rev_filled_bins]
+                    for bin_idx in empty_bins_list:
+                        if self._prev_rev_grid[bin_idx].max() > 0:
+                            self.grid[bin_idx] = self._prev_rev_grid[bin_idx]
+
+            self._prev_az_idx = az_end_idx
+            # Track latest azimuth for sweepline
+            self._last_az_deg = msg.end_azimuth_deg
+
+            # Save current state for next revolution's interpolation
+            if len(self._current_rev_filled_bins) > self.az_bins * 0.8:  # ~80% filled = complete revolution
+                self._prev_rev_grid = self.grid.copy()
+            self._az_buffer.append((msg.start_azimuth_deg, cells[:n].copy(), msg.start_range_cell))
+            if len(self._az_buffer) > self._az_buffer_maxlen:
+                self._az_buffer.popleft()
             self._msg_count += 1
             self._dirty = True
             if self.cell_size_m == 0.0 and msg.cell_duration_ns > 0:
                 self.cell_size_m       = 299_792_458.0 * msg.cell_duration_ns * 1e-9 / 2.0
                 self._cell_duration_ns = msg.cell_duration_ns
+
 
     def render(self, ax, title: str = "CAT240 PPI", colormap: str = "plasma"):
         """Renders the PPI image onto a matplotlib axis."""
@@ -593,9 +650,38 @@ class RadarPPI:
             self._draw_range_rings(ax, plt)
             self._rings_drawn_for_cell_size = self.cell_size_m
 
+        # Draw sweepline if enabled
+        if self.show_sweepline:
+            self._draw_sweepline(ax)
+
         reset_info = f'  |  {self.range_resets}× Range-Reset' if self.range_resets > 0 else ''
-        ax.set_title(f'{title}  |  {msg_count} azimuths{reset_info}', color='white', fontsize=10)
+
+        # Calculate current coverage: how many bins have any data
+        filled_bins = np.any(self._grid_render > 0, axis=1).sum()
+        coverage_pct = 100.0 * filled_bins / self.az_bins
+        coverage_info = f'  |  {coverage_pct:.1f}% coverage'
+
+        ax.set_title(f'{title}  |  {msg_count} msgs{reset_info}{coverage_info}', color='white', fontsize=10)
         return self._mesh
+
+    def _draw_sweepline(self, ax):
+        """Draw a sweepline showing the current azimuth."""
+        # Remove old sweepline if exists
+        if self._sweepline is not None:
+            try:
+                self._sweepline.remove()
+            except Exception:
+                pass
+
+        # Convert azimuth to radians (0° is up, clockwise)
+        az_rad = np.deg2rad(self._last_az_deg)
+        x_end = self.max_range_cells * np.sin(az_rad)
+        y_end = self.max_range_cells * np.cos(az_rad)
+
+        # Draw sweepline from center to edge
+        self._sweepline = ax.plot([0, x_end], [0, y_end],
+                                  color='#ffff00', linewidth=1.5, alpha=0.7,
+                                  label=f'Current: {self._last_az_deg:.1f}°')[0]
 
     def _draw_range_rings(self, ax, plt, interval_nm: float = 6.0):
         """Zeichnet Range-Ringe alle interval_nm Seemeilen (oder Bruchteile wenn cell_size unbekannt)."""
@@ -644,8 +730,306 @@ class RadarPPI:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# A-Scope
+# Debug-Fenster & A-Scope
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _find_zero_gaps(spoke: np.ndarray, min_len: int = 5) -> list:
+    """Findet zusammenhängende 0-Bereiche in einem Range-Profil.
+    Gibt [(start_cell, end_cell)] für Gaps >= min_len zurück."""
+    gaps = []
+    in_gap, g_start = False, 0
+    for i, v in enumerate(spoke):
+        if v == 0 and not in_gap:
+            in_gap, g_start = True, i
+        elif v != 0 and in_gap:
+            if i - g_start >= min_len:
+                gaps.append((g_start, i - 1))
+            in_gap = False
+    if in_gap and len(spoke) - g_start >= min_len:
+        gaps.append((g_start, len(spoke) - 1))
+    return gaps
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Waterfall Display
+# ─────────────────────────────────────────────────────────────────────────────
+
+class WaterfallDisplay:
+    """
+    Waterfall (Range-Azimuth) display: Azimuths on X-axis, range cells on Y-axis.
+    Black background with white azimuth labels; echoes colored like PPI (colormap).
+    """
+
+    def __init__(self, ppi: 'RadarPPI', colormap: str = "plasma",
+                 playback_state: dict = None, toggle_pause_fn = None):
+        import matplotlib.pyplot as plt
+
+        self.ppi = ppi
+        self.colormap = colormap
+        self.playback_state = playback_state or {}
+        self.toggle_pause_fn = toggle_pause_fn
+        self._mesh = None
+        self._mesh_ax = None
+        self._vmax_cached = 0.0
+        self._grid_render = np.zeros((ppi.max_range_cells, ppi.az_bins), dtype=np.float32)
+        self.zoom_active = [False]  # [0] = is_zoom_mode_active
+        self._zoom_rect = [None]  # Rectangle patch for zoom visualization
+
+        self.fig = plt.figure(figsize=(14, 6), facecolor='#0a0a0a')
+        self.fig.canvas.manager.set_window_title('Waterfall  |  CAT240')
+        self.ax = self.fig.add_subplot(111)
+
+        # Adjust subplots to leave room for buttons at bottom
+        self.fig.subplots_adjust(left=0.07, right=0.95, top=0.95, bottom=0.15)
+
+        self._setup_buttons()
+        self._setup_zoom_handlers()
+
+    def _setup_buttons(self):
+        """Setup Pause/Play and Zoom buttons (like PPI)."""
+        from matplotlib.widgets import Button
+
+        _BG  = '#111111'
+        _FG  = '#00ff41'
+        _HOV = '#1a2a1a'
+
+        BTN_Y = 0.01
+        BTN_H = 0.045
+
+        def _btn(rect, label):
+            ax_b = self.fig.add_axes(rect)
+            b = Button(ax_b, label, color=_BG, hovercolor=_HOV)
+            b.label.set_color(_FG)
+            b.label.set_fontsize(9)
+            b.label.set_fontfamily('monospace')
+            return b
+
+        # Pause/Play button
+        if self.toggle_pause_fn is not None:
+            self.btn_pause = _btn([0.07, BTN_Y, 0.08, BTN_H], 'Pause')
+
+            def on_pause_click(_):
+                paused = self.playback_state.get('paused', False)
+                self.playback_state['paused'] = not paused
+                self.toggle_pause_fn(not paused)
+                self.btn_pause.label.set_text('Play' if not paused else 'Pause')
+                self.fig.canvas.draw_idle()
+
+            self.btn_pause.on_clicked(on_pause_click)
+            x_next = 0.16
+        else:
+            x_next = 0.07
+
+        # Zoom button
+        self.btn_zoom = _btn([x_next, BTN_Y, 0.07, BTN_H], 'Zoom')
+
+        def on_zoom_click(_):
+            self.zoom_active[0] = not self.zoom_active[0]
+            # Highlight button when active
+            if self.zoom_active[0]:
+                self.btn_zoom.color = '#0a3a0a'
+                # Change cursor to crosshair (will be set when handlers are ready)
+                if hasattr(self, '_CUR_CROSS') and self._CUR_CROSS is not None:
+                    try:
+                        self.fig.canvas.set_cursor(self._CUR_CROSS)
+                    except Exception:
+                        pass
+            else:
+                self.btn_zoom.color = _BG
+                # Reset cursor
+                if hasattr(self, '_CUR_NORMAL') and self._CUR_NORMAL is not None:
+                    try:
+                        self.fig.canvas.set_cursor(self._CUR_NORMAL)
+                    except Exception:
+                        pass
+            self.fig.canvas.draw_idle()
+
+        self.btn_zoom.on_clicked(on_zoom_click)
+
+    def _setup_zoom_handlers(self):
+        """Setup scroll zoom, rectangle zoom with visualization, and double-click reset."""
+        import matplotlib.patches as mpatches
+
+        # Zoom rectangle state
+        self._zoom_start = [None]
+        self._zoom_last = [None]
+        self._zoom_rect = [None]
+
+        # Cursor management
+        try:
+            from matplotlib.backend_bases import cursors as _cursors
+            self._CUR_CROSS = _cursors.SELECT_REGION
+            self._CUR_NORMAL = _cursors.POINTER
+        except Exception:
+            self._CUR_CROSS = self._CUR_NORMAL = None
+
+        def _display_to_data(ex, ey):
+            """Convert display pixels to data coordinates."""
+            try:
+                return self.ax.transData.inverted().transform((ex, ey))
+            except Exception:
+                return None, None
+
+        def on_scroll(event):
+            """Scroll wheel zoom (only when zoom mode not active)."""
+            if self.zoom_active[0]:
+                return
+            if event.inaxes is not self.ax or event.xdata is None:
+                return
+            factor = 0.7 if event.step > 0 else 1.0 / 0.7
+            xlo, xhi = self.ax.get_xlim()
+            ylo, yhi = self.ax.get_ylim()
+            x0, y0 = event.xdata, event.ydata
+            self.ax.set_xlim(x0 + (xlo - x0) * factor, x0 + (xhi - x0) * factor)
+            self.ax.set_ylim(y0 + (ylo - y0) * factor, y0 + (yhi - y0) * factor)
+            self.fig.canvas.draw_idle()
+
+        def on_dblclick(event):
+            """Double-click to reset zoom."""
+            if event.inaxes is self.ax and getattr(event, 'dblclick', False):
+                self.ax.set_xlim(0, 360)
+                self.ax.set_ylim(0, self.ppi.max_range_cells)
+                self.fig.canvas.draw_idle()
+
+        def _zoom_press(event):
+            """Start rectangle zoom when button pressed."""
+            if not self.zoom_active[0]:
+                return
+            if event.button != 1:
+                return
+            if getattr(event, 'dblclick', False):
+                return
+            x, y = _display_to_data(event.x, event.y)
+            if x is None:
+                return
+            self._zoom_start[0] = (x, y)
+            self._zoom_last[0] = (x, y)
+
+        def _zoom_motion(event):
+            """Draw rectangle while dragging."""
+            if not self.zoom_active[0] or self._zoom_start[0] is None:
+                return
+            x, y = _display_to_data(event.x, event.y)
+            if x is None:
+                return
+            self._zoom_last[0] = (x, y)
+            # Remove old rectangle
+            if self._zoom_rect[0] is not None:
+                try:
+                    self._zoom_rect[0].remove()
+                except Exception:
+                    pass
+            # Draw new rectangle
+            x0, y0 = self._zoom_start[0]
+            rect = mpatches.Rectangle(
+                (min(x0, x), min(y0, y)), abs(x - x0), abs(y - y0),
+                linewidth=1.5, edgecolor='#00ff41', facecolor=(0, 1, 0, 0.08),
+                linestyle='--', zorder=10)
+            self.ax.add_patch(rect)
+            self._zoom_rect[0] = rect
+            self.fig.canvas.draw_idle()
+
+        def _zoom_release(event):
+            """Apply zoom when button released."""
+            if not self.zoom_active[0] or self._zoom_start[0] is None:
+                return
+            if event.button != 1:
+                return
+            # Remove rectangle
+            if self._zoom_rect[0] is not None:
+                try:
+                    self._zoom_rect[0].remove()
+                except Exception:
+                    pass
+                self._zoom_rect[0] = None
+            x0, y0 = self._zoom_start[0]
+            self._zoom_start[0] = None
+            # Get end point
+            x1, y1 = _display_to_data(event.x, event.y)
+            if x1 is None and self._zoom_last[0] is not None:
+                x1, y1 = self._zoom_last[0]
+            self._zoom_last[0] = None
+            # Check minimum zoom size
+            if x1 is None or (abs(x1 - x0) < 1 and abs(y1 - y0) < 1):
+                self.fig.canvas.draw_idle()
+                return
+            # Apply zoom
+            self.ax.set_xlim(min(x0, x1), max(x0, x1))
+            self.ax.set_ylim(min(y0, y1), max(y0, y1))
+            # Deactivate zoom mode
+            self.zoom_active[0] = False
+            self.btn_zoom.color = '#111111'
+            if self._CUR_NORMAL is not None:
+                try:
+                    self.fig.canvas.set_cursor(self._CUR_NORMAL)
+                except Exception:
+                    pass
+            self.fig.canvas.draw_idle()
+
+        self.fig.canvas.mpl_connect('scroll_event', on_scroll)
+        self.fig.canvas.mpl_connect('button_press_event', _zoom_press)
+        self.fig.canvas.mpl_connect('motion_notify_event', _zoom_motion)
+        self.fig.canvas.mpl_connect('button_release_event', _zoom_release)
+        self.fig.canvas.mpl_connect('button_press_event', on_dblclick)
+
+    def render(self, title: str = "Waterfall"):
+        """Renders the waterfall display (X=azimuth, Y=range)."""
+        import matplotlib.pyplot as plt
+        import matplotlib.colors as mcolors
+
+        with self.ppi._lock:
+            # Transpose: grid is [az_bins, range_cells], we want [range_cells, az_bins] for display
+            np.copyto(self._grid_render, self.ppi.grid.T)
+            self._vmax_cached = float(self._grid_render.max())
+
+        vmax = self._vmax_cached
+        norm = mcolors.PowerNorm(gamma=0.5, vmin=0, vmax=vmax) if vmax > 0 else None
+
+        if self._mesh is None or self._mesh_ax is not self.ax:
+            # First draw: create axis and pcolormesh
+            self.ax.clear()
+            self.ax.set_facecolor('#0a0a0a')
+
+            # X-axis: azimuths (0–360°)
+            x = np.linspace(0, 360, self.ppi.az_bins + 1)
+            # Y-axis: range cells
+            y = np.linspace(0, self.ppi.max_range_cells, self.ppi.max_range_cells + 1)
+            X, Y = np.meshgrid(x, y)
+
+            self._mesh = self.ax.pcolormesh(X, Y, self._grid_render, cmap=self.colormap,
+                                           norm=norm, shading='flat', rasterized=True)
+
+            # Set limits
+            self.ax.set_xlim(0, 360)
+            self.ax.set_ylim(0, self.ppi.max_range_cells)
+
+            # Styling: white labels/spines
+            self.ax.set_xlabel('Azimuth (°)', color='white', fontsize=10)
+            self.ax.set_ylabel('Range Cell', color='white', fontsize=10)
+            self.ax.set_title(title, color='white', fontsize=11, pad=10)
+
+            # White spines and white tick labels
+            for spine in self.ax.spines.values():
+                spine.set_edgecolor('white')
+                spine.set_linewidth(1.5)
+            self.ax.tick_params(axis='x', labelcolor='white', color='white')
+            self.ax.tick_params(axis='y', labelcolor='white', color='white')
+
+            # Add colorbar
+            cbar = self.fig.colorbar(self._mesh, ax=self.ax, pad=0.02)
+            cbar.set_label('Amplitude', color='white', fontsize=9)
+            cbar.ax.tick_params(labelcolor='white', color='white')
+
+            self._mesh_ax = self.ax
+        else:
+            # Update existing mesh
+            if vmax > 0:
+                self._mesh.set_norm(norm)
+            self._mesh.set_array(self._grid_render.ravel())
+            self.ax.set_title(title, color='white', fontsize=11, pad=10)
+
+        self.fig.canvas.draw_idle()
+
 
 class AScope:
     """
@@ -2127,7 +2511,10 @@ def replay_pcap(filepath: str, speed: float = 1.0,
                 filter_stream: Optional[Tuple[str, int]] = None,
                 log_compress: bool = False,
                 loop: bool = False,
-                no_filter: bool = False):
+                no_filter: bool = False,
+                interpolate_gaps: bool = False,
+                show_sweepline: bool = False,
+                show_waterfall: bool = False):
     """
     Plays back a PCAP file in a time-controlled manner.
     A background thread reads packets with original timing (× speed),
@@ -2164,7 +2551,7 @@ def replay_pcap(filepath: str, speed: float = 1.0,
     print(f"{'='*60}\n")
 
     decoder       = Cat240Decoder()
-    ppi           = RadarPPI(max_range_cells=1024, az_bins=4096)
+    ppi           = RadarPPI(max_range_cells=1024, az_bins=4096, interpolate_gaps=interpolate_gaps, show_sweepline=show_sweepline)
     msg_queue     = queue.Queue(maxsize=50000)
     state         = {'done': False, 'msgs': 0, 'loop': 0}
     playback_state = {'paused': False}
@@ -2272,12 +2659,25 @@ def replay_pcap(filepath: str, speed: float = 1.0,
                                   playback_state, toggle_pause_fn=_toggle_pause_replay)
     _attach_ppi_scroll_zoom(fig_ppi, ax_ppi, ppi)
 
+    # Create waterfall window if enabled
+    waterfall = None
+    if show_waterfall:
+        waterfall = WaterfallDisplay(ppi, playback_state=playback_state,
+                                     toggle_pause_fn=_toggle_pause_replay)
+
     def on_ppi_click(event):
         if ppi_btns['zoom_active'][0]:
             return
         if getattr(event, 'dblclick', False):
             return
         if event.inaxes != ax_ppi or event.xdata is None:
+            return
+        if event.key in ('shift+ctrl', 'ctrl+shift'):
+            az_deg = np.degrees(np.arctan2(event.xdata, event.ydata)) % 360.0
+            rc = int(round(np.sqrt(event.xdata**2 + event.ydata**2)))
+            if dbg is None or not plt.fignum_exists(dbg.fig.number):
+                plt.show(block=False)
+            dbg.update(az_deg, rc)
             return
         asc = ascope_ref[0]
         if asc is None:
@@ -2324,6 +2724,8 @@ def replay_pcap(filepath: str, speed: float = 1.0,
         asc = ascope_ref[0]
         if asc is not None:
             asc.render()
+        if waterfall is not None:
+            waterfall.render(title=f"Waterfall  |  {speed}x{status}")
         return []
 
     print(f"\n  Replay: {filepath}")
@@ -2344,7 +2746,10 @@ def replay_pcap(filepath: str, speed: float = 1.0,
 
 def live_stream(host: str = '0.0.0.0', port: int = 5000,
                 multicast_group: Optional[str] = None,
-                log_compress: bool = False):
+                log_compress: bool = False,
+                interpolate_gaps: bool = False,
+                show_sweepline: bool = False,
+                show_waterfall: bool = False):
     """
     Receives CAT240 datagrams live via UDP and updates
     PPI + A-Scope in real-time.
@@ -2355,7 +2760,8 @@ def live_stream(host: str = '0.0.0.0', port: int = 5000,
     import matplotlib.animation as animation
 
     decoder = Cat240Decoder()
-    ppi     = RadarPPI(max_range_cells=1024, az_bins=4096)
+    ppi     = RadarPPI(max_range_cells=1024, az_bins=4096, interpolate_gaps=interpolate_gaps, show_sweepline=show_sweepline)
+    waterfall = WaterfallDisplay(ppi) if show_waterfall else None
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -2463,12 +2869,25 @@ def live_stream(host: str = '0.0.0.0', port: int = 5000,
                                   playback_state, toggle_pause_fn=_toggle_pause_live)
     _attach_ppi_scroll_zoom(fig_ppi, ax_ppi, ppi)
 
+    # Create waterfall window if enabled
+    waterfall = None
+    if show_waterfall:
+        waterfall = WaterfallDisplay(ppi, playback_state=playback_state,
+                                     toggle_pause_fn=_toggle_pause_live)
+
     def on_ppi_click(event):
         if ppi_btns['zoom_active'][0]:
             return
         if getattr(event, 'dblclick', False):
             return
         if event.inaxes != ax_ppi or event.xdata is None:
+            return
+        if event.key in ('shift+ctrl', 'ctrl+shift'):
+            az_deg = np.degrees(np.arctan2(event.xdata, event.ydata)) % 360.0
+            rc = int(round(np.sqrt(event.xdata**2 + event.ydata**2)))
+            if dbg is None or not plt.fignum_exists(dbg.fig.number):
+                plt.show(block=False)
+            dbg.update(az_deg, rc)
             return
         asc = ascope_ref[0]
         if asc is None:
@@ -2502,6 +2921,8 @@ def live_stream(host: str = '0.0.0.0', port: int = 5000,
         asc = ascope_ref[0]
         if asc is not None:
             asc.render()
+        if waterfall is not None:
+            waterfall.render(title=f"Waterfall  |  Port {port}")
         return az_line,
 
     ani = animation.FuncAnimation(fig_ppi, update,
@@ -2509,6 +2930,68 @@ def live_stream(host: str = '0.0.0.0', port: int = 5000,
                                   cache_frame_data=False)
     plt.show()
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuration loader (JSON)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_config(config_path: str) -> dict:
+    """Load configuration from JSON file."""
+    import json
+    try:
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        if not isinstance(config, dict):
+            print(f"  Error: Config file must contain a JSON object (dictionary), not {type(config).__name__}")
+            sys.exit(1)
+        return config
+    except FileNotFoundError:
+        print(f"  Error: Config file not found: {config_path}")
+        sys.exit(1)
+    except json.JSONDecodeError as e:
+        print(f"  Error: Invalid JSON in config file: {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"  Error: Failed to load config file: {e}")
+        sys.exit(1)
+
+def _apply_config_to_args(args, config: dict):
+    """Apply configuration from JSON to parsed arguments (CLI args take precedence)."""
+    # Map JSON keys to argparse argument names
+    key_mapping = {
+        'replay': 'replay',
+        'live': 'live',
+        'speed': 'speed',
+        'loop': 'loop',
+        'stream': 'stream',
+        'no_filter': 'no_filter',
+        'port': 'port',
+        'host': 'host',
+        'multicast': 'multicast',
+        'log_compress': 'log_compress',
+        'interpolate': 'interpolate',
+        'sweepline': 'sweepline',
+        'waterfall': 'waterfall',
+    }
+
+    for json_key, arg_name in key_mapping.items():
+        if json_key in config:
+            # Only apply if argument was not explicitly set on command line
+            # For boolean flags, only apply if they are False (not set) in args
+            current_val = getattr(args, arg_name)
+            if arg_name in ('log_compress', 'interpolate', 'sweepline', 'waterfall',
+                           'loop', 'no_filter'):
+                # Boolean flags: only apply from config if currently False
+                if not current_val:
+                    setattr(args, arg_name, config[json_key])
+            elif arg_name in ('live',):
+                # 'live' is special: only apply from config if not True
+                if not current_val:
+                    setattr(args, arg_name, config[json_key])
+            else:
+                # Other arguments: apply if their current value is None or default
+                if current_val is None or (isinstance(current_val, (int, float)) and arg_name == 'speed' and current_val == 1.0):
+                    setattr(args, arg_name, config[json_key])
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI entry point
@@ -2520,7 +3003,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__
     )
-    mode_group = parser.add_mutually_exclusive_group(required=True)
+    parser.add_argument('--config', type=str, default=None, help='Load configuration from JSON file (CLI args take precedence)')
+
+    mode_group = parser.add_mutually_exclusive_group(required=False)
     mode_group.add_argument('--replay', metavar='PCAP', help='Play back a PCAP/PCAPNG file in a time-controlled manner')
     mode_group.add_argument('--live',   action='store_true', help='Live UDP reception')
 
@@ -2536,9 +3021,22 @@ def main():
     live_group.add_argument('--multicast', type=str, default=None,      help='Multicast group to join (e.g. 239.1.1.1)')
 
     parser.add_argument('--log-compress', action='store_true', help='Show log-compressed A-Scope overlay (0-255, P0 auto-estimated)')
+    parser.add_argument('--interpolate',  action='store_true', help='Interpolate missing azimuths in gaps (for imperfect data)')
+    parser.add_argument('--sweepline',    action='store_true', help='Show rotating sweepline indicating current azimuth')
+    parser.add_argument('--waterfall',    action='store_true', help='Show waterfall display (range vs. azimuth, white background)')
     parser.add_argument('--verbose',      action='store_true', default=True)
 
     args = parser.parse_args()
+
+    # Load config from JSON file if specified
+    if args.config:
+        config = _load_config(args.config)
+        _apply_config_to_args(args, config)
+        print(f"  Loaded configuration from: {args.config}")
+
+    # Validate that either --replay or --live was specified
+    if not (args.replay or args.live):
+        parser.error("One of --replay or --live is required")
 
     try:
         import matplotlib
@@ -2567,13 +3065,17 @@ def main():
             default_multicast = args.multicast or '',
         )
         live_stream(host=host, port=port, multicast_group=multicast,
-                    log_compress=args.log_compress)
+                    log_compress=args.log_compress, interpolate_gaps=args.interpolate,
+                    show_sweepline=args.sweepline, show_waterfall=args.waterfall)
     else:
         replay_pcap(filepath=args.replay, speed=args.speed,
                     filter_stream=filter_stream,
                     log_compress=args.log_compress,
                     loop=args.loop,
-                    no_filter=args.no_filter)
+                    no_filter=args.no_filter,
+                    interpolate_gaps=args.interpolate,
+                    show_sweepline=args.sweepline,
+                    show_waterfall=args.waterfall)
 
 
 if __name__ == '__main__':
