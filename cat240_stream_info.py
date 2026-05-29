@@ -52,6 +52,8 @@ class Cat240Message:
     fspec_hex:         str = ""
     item_types:        list = field(default_factory=list, repr=False)
     cell_bits:         int = 0    # 8, 16 or 32
+    tod_ms:            int = 0    # Time of Day in milliseconds since midnight (I240/140)
+    vrh:               int = 0    # Video Record Header (I240/020)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -88,6 +90,8 @@ class Cat240Decoder:
             'video': np.array([], dtype=np.float32),
             'num_cells': 0, 'compression': 0,
             'sac': 0, 'sic': 0, 'cell_bits': 0, 'res': 0,
+            'tod_ms': 0,
+            'vrh': 0,
         }
 
         for item in active_items:
@@ -113,6 +117,8 @@ class Cat240Decoder:
             fspec_hex         = bytes(fspec).hex(),
             item_types        = active_items,
             cell_bits         = result['cell_bits'],
+            tod_ms            = result['tod_ms'],
+            vrh               = result['vrh'],
         )
 
     def _parse_item(self, data, offset, length, item, result):
@@ -130,6 +136,9 @@ class Cat240Decoder:
 
             elif item == 3:
                 # I240/020 – Video Record Header (MSG_INDEX 32 bit), 4 bytes
+                if offset + 4 <= length:
+                    vrh = struct.unpack(">I", data[offset:offset+4])[0]
+                    result['vrh'] = vrh
                 return offset + 4
 
             elif item == 4:
@@ -221,7 +230,10 @@ class Cat240Decoder:
                 return offset + 1 + video_bytes
 
             elif item == 12:
-                # I240/140 – Time of Day, 3 bytes
+                # I240/140 – Time of Day, 3 bytes (milliseconds since midnight UTC)
+                if offset + 3 <= length:
+                    tod_raw = struct.unpack(">I", b'\x00' + data[offset:offset+3])[0]  # 3 bytes → 32-bit
+                    result['tod_ms'] = tod_raw
                 return offset + 3
 
             elif item in (13, 14):
@@ -407,13 +419,17 @@ class StreamStats:
         self.az_deltas   = []
         self._prev_az    = None
         self.timestamps  = []
+        self.pcap_timestamps = []  # Absolute PCAP-Timestamps für Gap-Analyse
         # Per-revolution statistics
         self.rev_packet_counts = []     # Video-Header-Count pro vollständiger Revolution
         self.rev_coverages     = []     # Coverage (°) pro vollständiger Revolution
         self.rev_max_gaps      = []     # Größte Lücke (°) pro vollständiger Revolution
+        self.rev_azimuths_per_msg = []  # [[(az, msg_idx), ...], ...] Azimuthe pro Revolution
         self._cur_rev_count    = 0      # Zähler für aktuelle Umdrehung
         self._cur_rev_spans    = []     # [(start_az, end_az)] der aktuellen Umdrehung
+        self._cur_rev_msg_azimuths = [] # [(azimuth, msg_index)] für aktuelle Revolution
         self._is_first_rev     = True   # erste Umdrehung in der Datei ist immer partial
+        self._msg_count_at_rev_start = 0
         # Amplitude: sample data
         self.amp_min     = np.inf
         self.amp_max     = -np.inf
@@ -424,7 +440,9 @@ class StreamStats:
         self._AMP_LIMIT  = 200_000
 
     def add(self, msg: Cat240Message, ts: float, src_ip: str = ''):
+        # Speichere absoluten PCAP-Timestamp und relativen für interne Nutzung
         self.msg_count += 1
+        self.pcap_timestamps.append(ts)
         self.timestamps.append(ts)
         if src_ip:
             self.src_ips.add(src_ip)
@@ -442,6 +460,9 @@ class StreamStats:
                 self.cell_dur_unit = 'fs'
 
         self.azimuth_list.append(msg.start_azimuth_deg)
+        # Track (start_az, end_az, message_index, absolute_pcap_timestamp, vrh) für aktuelle Revolution
+        self._cur_rev_msg_azimuths.append((msg.start_azimuth_deg, msg.end_azimuth_deg, self.msg_count - 1, ts, msg.vrh))
+
         if self._prev_az is not None:
             raw_d = msg.start_azimuth_deg - self._prev_az
             # Wrap-around = Umdrehungsgrenze erkannt (VOR der Normalisierung)
@@ -454,8 +475,11 @@ class StreamStats:
                     self.rev_packet_counts.append(self._cur_rev_count)
                     self.rev_coverages.append(cov)
                     self.rev_max_gaps.append(gap)
+                    # Speichere die Message-Azimuthe der abgeschlossenen Revolution
+                    self.rev_azimuths_per_msg.append(self._cur_rev_msg_azimuths.copy())
                 self._cur_rev_count = 0
                 self._cur_rev_spans = []
+                self._cur_rev_msg_azimuths = []
             # Normalisieren für Delta-Liste
             d = raw_d
             if d < -180: d += 360
@@ -671,6 +695,243 @@ def _az_stats(stats: StreamStats):
         r['gap_median_deg'] = float(np.median(stats.rev_max_gaps))
         r['gap_max_deg']    = float(np.max(stats.rev_max_gaps))
     return r
+
+
+def analyze_gaps_per_revolution(stats: StreamStats, max_revs: int = 10) -> tuple:
+    """Analysiert Lücken pro Umdrehung und gibt strukturierte Daten zurück.
+
+    Args:
+        stats: StreamStats object
+        max_revs: max. Anzahl Revolutions mit Lücken anzuzeigen
+
+    Returns:
+        Tuple (table_md, table_data) where:
+        - table_md: Markdown table string
+        - table_data: List of gap data dicts for PDF/other formatting
+    """
+    if not stats.rev_coverages or not stats.rev_max_gaps or len(stats.azimuth_list) < 10:
+        return "(keine per-revolution Statistiken vorhanden)", []
+
+    # Finde Revolutions mit echten Lücken (Gap > 0.01°)
+    revs_with_gaps = []
+    for rev_idx, (cov, gap) in enumerate(zip(stats.rev_coverages, stats.rev_max_gaps)):
+        if gap > 0.01:  # Nur Lücken größer als 0.01° (Quantisierungsartefakte filtern)
+            revs_with_gaps.append({
+                'rev_idx': rev_idx,
+                'coverage': cov,
+                'max_gap': gap
+            })
+
+    if not revs_with_gaps:
+        return "✓ Alle Revolutionen haben vollständige Abdeckung (keine Lücken > 0.01°)", []
+
+    # Sortiere nach größter Lücke
+    revs_sorted = sorted(revs_with_gaps, key=lambda x: x['max_gap'], reverse=True)
+
+    gap_data = []
+    lines = []
+    lines.append(f"Found {len(revs_with_gaps)} revolution(s) with gaps\n")
+    lines.append("")
+
+    # Tabellen-Header (kompakt)
+    lines.append("| Rev | Max Gap (°) | Coverage (%) | Gap Range (°) | Before msg → After msg |")
+    lines.append("|-----|-------------|--------------|---------------|------------------------|")
+
+    # Analysiere die Revolutions mit Lücken
+    for rev_info in revs_sorted[:max_revs]:
+        rev_num = rev_info['rev_idx'] + 1
+
+        # Verwende pre-recorded message azimuth data
+        if rev_info['rev_idx'] < len(stats.rev_azimuths_per_msg):
+            msg_az_list = stats.rev_azimuths_per_msg[rev_info['rev_idx']]
+            if len(msg_az_list) >= 2:
+                # Extrahiere Start-Azimuthe, End-Azimuthe, Message Indices, Timestamps und VRH
+                start_azimuths = np.array([start_az for start_az, _, _, _, _ in msg_az_list], dtype=np.float64)
+                end_azimuths = np.array([end_az for _, end_az, _, _, _ in msg_az_list], dtype=np.float64)
+                msg_indices = np.array([idx for _, _, idx, _, _ in msg_az_list], dtype=np.int32)
+                msg_timestamps = np.array([ts for _, _, _, ts, _ in msg_az_list], dtype=np.float64)
+                msg_vrh = np.array([vrh for _, _, _, _, vrh in msg_az_list], dtype=np.int32)
+
+                # Sammle alle Azimuthe (Start und End) und normalisiere auf [0, 360)
+                all_az = np.concatenate([start_azimuths, end_azimuths]) % 360.0
+                all_az_sorted = np.sort(all_az)
+
+                # Finde größte Lücke zwischen konsekutiven Azimuthe
+                max_gap = 0
+                gap_info = None
+                gap_start_az = None
+                gap_end_az = None
+
+                # Gaps zwischen aufeinanderfolgenden Azimuthe
+                for i in range(len(all_az_sorted) - 1):
+                    gap = all_az_sorted[i+1] - all_az_sorted[i]
+                    if gap > max_gap:
+                        max_gap = gap
+                        gap_start_az = all_az_sorted[i]
+                        gap_end_az = all_az_sorted[i+1]
+
+                # Wrap-around Gap
+                wrap_gap = (all_az_sorted[0] + 360.0) - all_az_sorted[-1]
+                if wrap_gap > max_gap:
+                    max_gap = wrap_gap
+                    gap_start_az = all_az_sorted[-1]
+                    gap_end_az = all_az_sorted[0]
+
+                # Finde die Messages before und after der größten Lücke
+                if gap_start_az is not None and gap_end_az is not None:
+                    # Normalisiere alle Azimuthe
+                    start_az_norm = start_azimuths % 360.0
+                    end_az_norm = end_azimuths % 360.0
+
+                    # Finde Before Message: deren End Azimuth sollte unmittelbar VOR gap_start_az liegen
+                    # (kleinste positive Distanz von End Az zu gap_start_az)
+                    best_before_pos = None
+                    best_before_dist = float('inf')
+                    for i in range(len(end_az_norm)):
+                        d = (gap_start_az - end_az_norm[i]) % 360.0
+                        # Nur Messages akzeptieren, deren End Az vor der Lücke liegt (0 <= d <= 180)
+                        if 0 <= d <= 180 and d < best_before_dist:
+                            best_before_dist = d
+                            best_before_pos = i
+
+                    # Finde After Message: deren Start Azimuth sollte unmittelbar NACH gap_end_az liegen
+                    # (kleinste positive Distanz von gap_end_az zu Start Az)
+                    best_after_pos = None
+                    best_after_dist = float('inf')
+                    for i in range(len(start_az_norm)):
+                        d = (start_az_norm[i] - gap_end_az) % 360.0
+                        # Nur Messages akzeptieren, deren Start Az nach der Lücke liegt (0 <= d <= 180)
+                        if 0 <= d <= 180 and d < best_after_dist:
+                            best_after_dist = d
+                            best_after_pos = i
+
+                    before_pos = best_before_pos
+                    after_pos = best_after_pos
+
+                    if before_pos is not None and after_pos is not None:
+                        before_vrh = msg_vrh[before_pos]
+                        before_start = start_azimuths[before_pos]
+                        before_end = end_azimuths[before_pos]
+                        before_ts = msg_timestamps[before_pos]
+
+                        after_vrh = msg_vrh[after_pos]
+                        after_start = start_azimuths[after_pos]
+                        after_end = end_azimuths[after_pos]
+                        after_ts = msg_timestamps[after_pos]
+
+                        # Speichere Daten für detaillierte Darstellung
+                        gap_data.append({
+                            'rev': rev_num,
+                            'max_gap': rev_info['max_gap'],
+                            'coverage': rev_info['coverage'],
+                            'gap_start': gap_start_az,
+                            'gap_end': gap_end_az,
+                            'before_vrh': before_vrh,
+                            'before_start': before_start,
+                            'before_end': before_end,
+                            'before_ts': before_ts,
+                            'after_vrh': after_vrh,
+                            'after_start': after_start,
+                            'after_end': after_end,
+                            'after_ts': after_ts
+                        })
+
+                        # Markdown Tabellen-Zeile (kompakt)
+                        from datetime import datetime, timezone
+                        def _format_ts(ts):
+                            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+                            return dt.strftime('%H:%M:%S.%f')[:-3]
+
+                        gap_range = f"{gap_start_az:.2f}–{gap_end_az:.2f}"
+                        before_ts_fmt = _format_ts(before_ts)
+                        after_ts_fmt = _format_ts(after_ts)
+                        msg_range = f"[VRH {before_vrh}] {before_ts_fmt} {before_end:.2f} → [VRH {after_vrh}] {after_ts_fmt} {after_start:.2f}"
+                        lines.append(
+                            f"| {rev_num} | {rev_info['max_gap']:.4f} | {rev_info['coverage']:.2f} | "
+                            f"{gap_range} | {msg_range} |"
+                        )
+
+    return "\n".join(lines), gap_data
+
+
+def analyze_azimuth_gaps(stats: StreamStats, max_gaps: int = 5, overlap_tolerance: float = 2.0) -> str:
+    """Analysiert Lücken unter Berücksichtigung zirkulärer Übergänge (0°/360°).
+
+    Args:
+        stats: StreamStats object
+        max_gaps: max. Anzahl der Lücken auszuzeigen
+        overlap_tolerance: Toleranz (°) für Überlappung bei 0°/360° Übergang
+
+    Returns:
+        Formatted string with gap analysis
+    """
+    if len(stats.azimuth_list) < 10:
+        return "(zu wenige Azimuthe für Lücken-Analyse)"
+
+    az = np.array(stats.azimuth_list, dtype=np.float64)
+
+    # Normalisiere Azimuthe auf [0, 360)
+    az = az % 360.0
+    az_sorted = np.sort(az)
+
+    # Prüfe Wrap-around: wenn Azimuthe von z.B. 350° bis 10° reichen,
+    # dann sind 0° und 360° implizit abgedeckt (Überlappung)
+    span_start = az_sorted[0]
+    span_end = az_sorted[-1]
+    total_span = span_end - span_start
+
+    # Wenn die Spannweite < 180° ist, dann gibt es möglicherweise eine große Lücke
+    # Wenn die Spannweite >= 180°, prüfe ob der Wrap-around abgedeckt ist
+
+    has_wrap_overlap = False
+    if total_span >= (360.0 - overlap_tolerance):
+        # Volle oder nahezu volle Abdeckung durch Wrap-around
+        has_wrap_overlap = True
+
+    # Finde Lücken zwischen consecutiven Azimuthe
+    gaps = []
+    for i in range(len(az_sorted) - 1):
+        delta = az_sorted[i+1] - az_sorted[i]
+        if delta > 0.5:  # Lücke größer als 0.5°
+            gaps.append({
+                'from': az_sorted[i],
+                'to': az_sorted[i+1],
+                'size': delta,
+                'idx': i
+            })
+
+    # Wrap-around Lücke (von letztem bis zu erstem Azimuth)
+    # Aber nur wenn NICHT bereits durch overlap_tolerance abgedeckt
+    wrap_gap = (az_sorted[0] + 360.0) - az_sorted[-1]
+    if wrap_gap > overlap_tolerance and not has_wrap_overlap:
+        gaps.append({
+            'from': az_sorted[-1],
+            'to': az_sorted[0] + 360.0,
+            'size': wrap_gap,
+            'idx': -1
+        })
+
+    if not gaps:
+        return "✓ Keine Lücken (vollständige 360° Abdeckung mit Wrap-Around)"
+
+    # Sortiere nach Größe (absteigend)
+    gaps_sorted = sorted(gaps, key=lambda x: x['size'], reverse=True)
+
+    result = f"Found {len(gaps)} gaps (overlap_tolerance={overlap_tolerance}°):\n"
+    for i, gap in enumerate(gaps_sorted[:max_gaps]):
+        result += f"  {i+1}. {gap['from']:.4f}° → {gap['to']:.4f}° ({gap['size']:.4f}°)\n"
+
+    if len(gaps_sorted) > max_gaps:
+        total_missing = sum(g['size'] for g in gaps_sorted[max_gaps:])
+        result += f"  ... and {len(gaps_sorted) - max_gaps} more (total {total_missing:.2f}°)\n"
+
+    total_gap_deg = sum(g['size'] for g in gaps)
+    result += f"\nTotal missing: {total_gap_deg:.2f}° out of 360°"
+
+    # Debug info
+    result += f"\n[Span: {span_start:.2f}° → {span_end:.2f}° ({total_span:.2f}°)]"
+
+    return result
 
 
 _MIN_REV_COVERAGE = 355.0   # Grad — Umdrehungen mit weniger Abdeckung werden verworfen
@@ -904,7 +1165,7 @@ def _mini_bar(value: float, max_val: float, width: int = 20) -> str:
 
 
 def print_report(filepath: str, streams: Dict[str, StreamStats],
-                 total_udp: int, non_cat240: int):
+                 total_udp: int, non_cat240: int, show_gaps: bool = False):
 
     total_msgs = sum(s.msg_count for s in streams.values())
     all_ts = []
@@ -1018,6 +1279,7 @@ def print_report(filepath: str, streams: Dict[str, StreamStats],
         # Azimuth – per revolution
         left.add_row("", "")
         left.add_row("[bold magenta]── Azimuth (per revolution) ──", "")
+        left.add_row("Complete revolutions", str(len(s.rev_max_gaps)))
         if az:
             if 'spokes_per_rev' in az:
                 left.add_row("Azimuths/revolution", f"~{az['spokes_per_rev']}")
@@ -1046,6 +1308,23 @@ def print_report(filepath: str, streams: Dict[str, StreamStats],
                 left.add_row("Total revolutions", f"{az['revs']:.1f}")
             if 'rpm_timestamps' in az:
                 left.add_row("RPM", f"{az['rpm_timestamps']:.1f}  [dim](from timestamps)[/]")
+
+        # Azimuth gaps (missing angles)
+        left.add_row("", "")
+        left.add_row("[bold magenta]── Azimuth gaps (overall) ──", "")
+        gap_analysis = analyze_azimuth_gaps(s, max_gaps=3)
+        gap_lines = gap_analysis.split('\n')
+        for line in gap_lines[:6]:  # Show first 6 lines
+            left.add_row("[dim]" + line + "[/]", "")
+
+        # Per-revolution gaps
+        if show_gaps:
+            left.add_row("", "")
+            left.add_row("[bold magenta]── Azimuth gaps (per revolution) ──", "")
+            rev_gap_md, rev_gap_data = analyze_gaps_per_revolution(s, max_revs=1000)
+            rev_gap_lines = rev_gap_md.split('\n')
+            for line in rev_gap_lines:  # Show all lines
+                left.add_row("[dim]" + line + "[/]", "")
 
         # CELL_DUR
         left.add_row("", "")
@@ -1206,7 +1485,7 @@ def print_report_plain(filepath, streams, total_udp, non_cat240):
 
 def write_markdown(filepath: str, streams: Dict[str, StreamStats],
                    total_udp: int, non_cat240: int,
-                   md_path: str) -> None:
+                   md_path: str, show_gaps: bool = False) -> None:
     """Writes the analysis report as a Markdown file."""
     from datetime import datetime
 
@@ -1300,6 +1579,7 @@ def write_markdown(filepath: str, streams: Dict[str, StreamStats],
         w()
         w("| Parameter | Value |")
         w("|---|---|")
+        w(f"| Complete revolutions | {len(s.rev_max_gaps)} |")
         if az:
             if 'spokes_per_rev' in az:
                 w(f"| Azimuths/revolution | ~{az['spokes_per_rev']} |")
@@ -1438,6 +1718,28 @@ def write_markdown(filepath: str, streams: Dict[str, StreamStats],
     w()
     w(f"*Generated by cat240_stream_info.py*")
 
+    # ── Azimuth gaps per stream (optional section) ───────────────────────────────
+    if show_gaps:
+        w()
+        w('<div style="page-break-before: always"></div>')
+        w()
+        w("# Azimuth Gaps per Revolution (Detailed Analysis)")
+        w()
+
+        for idx, (key, s) in enumerate(sorted(streams.items(), key=_stream_sort_key), 1):
+            if idx > 1:
+                w('<div style="page-break-before: always"></div>')
+                w()
+            w(f"## Stream {idx}: `{s.net_key}`  ·  {_range_label(s)}")
+            w()
+
+            gap_md, gap_data = analyze_gaps_per_revolution(s, max_revs=1000)
+            gap_lines = gap_md.split('\n')
+            for line in gap_lines:
+                if line.strip():
+                    w(line)
+            w()
+
     with open(md_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
@@ -1448,7 +1750,8 @@ def write_markdown(filepath: str, streams: Dict[str, StreamStats],
 # ─────────────────────────────────────────────────────────────────────────────
 
 def write_pdf(filepath: str, streams: Dict[str, StreamStats],
-              total_udp: int, non_cat240: int, pdf_path: str) -> None:
+              total_udp: int, non_cat240: int, pdf_path: str,
+              show_gaps: bool = False) -> None:
     """Erzeugt einen formatierten PDF-Report mit fpdf2."""
     try:
         from fpdf import FPDF, XPos, YPos
@@ -1470,13 +1773,15 @@ def write_pdf(filepath: str, streams: Dict[str, StreamStats],
     class PDF(FPDF):
         def header(self):
             self.set_fill_color(*C_HEADER)
-            self.rect(0, 0, 210, 10, 'F')
+            # Use page width instead of hardcoded 210
+            page_width = self.w
+            self.rect(0, 0, page_width, 10, 'F')
             self.set_font('Helvetica', 'B', 8)
             self.set_text_color(255, 255, 255)
             self.set_xy(10, 2)
             self.cell(0, 6, 'CAT240 Stream Analysis', align='L')
             self.set_xy(0, 2)
-            self.cell(200, 6, f'Page {self.page_no()}', align='R')
+            self.cell(page_width - 20, 6, f'Page {self.page_no()}', align='R')
             self.set_text_color(*C_TEXT)
             self.ln(12)
 
@@ -1493,6 +1798,12 @@ def write_pdf(filepath: str, streams: Dict[str, StreamStats],
     pdf.add_page()
 
     W = 182  # nutzbare Seitenbreite
+
+    def _format_timestamp(ts: float) -> str:
+        """Formatiere PCAP-Timestamp (Unix-Zeit) als HH:MM:SS.ms UTC"""
+        from datetime import datetime, timezone
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+        return dt.strftime('%H:%M:%S.%f')[:-3]
 
     def _s(text):
         """Ersetzt nicht-Latin1-Zeichen für fpdf2-Standardfonts."""
@@ -1684,7 +1995,7 @@ def write_pdf(filepath: str, streams: Dict[str, StreamStats],
         # Azimuth – pro Umdrehung
         if az:
             h3('Azimuth - per revolution')
-            az_rev_rows = []
+            az_rev_rows = [('Complete revolutions', str(len(s.rev_max_gaps)))]
             if 'spokes_per_rev' in az:
                 az_rev_rows.append(('Azimuths/revolution', f"~{az['spokes_per_rev']}"))
             if 'step_median' in az:
@@ -1852,6 +2163,174 @@ def write_pdf(filepath: str, streams: Dict[str, StreamStats],
              new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.set_text_color(*C_TEXT)
 
+    # ── Azimuth gaps per stream (optional section) ───────────────────────────────
+    if not show_gaps:
+        pdf.output(pdf_path)
+        return
+
+    for idx, (key, s) in enumerate(sorted(streams.items(), key=_stream_sort_key), 1):
+        # Start with landscape page for gaps table
+        pdf.add_page(orientation='L')
+        pdf.set_margins(14, 14, 14)
+
+        # Reset font and colors for landscape
+        pdf.set_font('Helvetica', 'B', 14)
+        pdf.set_text_color(*C_HEADER)
+        pdf.cell(0, 10, 'Azimuth Gaps per Revolution (Detailed Analysis)', new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.ln(4)
+
+        pdf.set_font('Helvetica', 'B', 11)
+        pdf.set_text_color(*C_SECTION)
+        pdf.cell(0, 8, _s(f'Stream {idx}: {s.net_key}  ·  {_range_label(s)}'),
+                 new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.ln(2)
+
+        # Get gap analysis
+        gap_md, gap_data = analyze_gaps_per_revolution(s, max_revs=1000)
+
+        if gap_data:
+            # Sort by revolution number
+            gap_data_sorted = sorted(gap_data, key=lambda x: x['rev'])
+
+            # Deaktiviere automatische Seitenumlagerung für manuelle Kontrolle
+            pdf.set_auto_page_break(auto=False)
+
+            # Manually draw table with proper formatting and repeating headers
+            # Full landscape width: ~280mm, margins 14mm each = ~252mm usable - nutze ganze Breite
+            usable_width = 252
+            col_widths = [10, 28, 30, 33, 14, 20, 26, 14, 20, 30]  # Rev | MaxGap | Coverage | GapRange | BeforeVRH | BeforeTime | BeforeEndAz | AfterVRH | AfterTime | AfterStartAz
+
+            # Reset für neuen Stream: erste Seite hat 25 Zeilen, folgende 35
+            first_page = True
+
+            pdf.set_font('Helvetica', 'B', 8)
+            pdf.set_fill_color(*C_HEADER)
+            pdf.set_text_color(255, 255, 255)
+
+            def draw_table_header():
+                """Draw table header with main and sub columns."""
+                # Stelle sicher, dass Fonts und Farben korrekt sind
+                pdf.set_font('Helvetica', 'B', 8)
+                pdf.set_fill_color(*C_HEADER)
+                pdf.set_text_color(255, 255, 255)
+
+                # Berechne Offset, um Tabelle zu zentrieren
+                table_width = sum(col_widths)
+                page_width = pdf.w - pdf.l_margin - pdf.r_margin
+                left_offset = (page_width - table_width) / 2
+
+                if left_offset > 0:
+                    pdf.set_x(pdf.l_margin + left_offset)
+
+                # Main headers
+                pdf.cell(col_widths[0], 7, _s('Rev'), border=1, fill=True, align='C')
+                pdf.cell(col_widths[1], 7, _s('Max Gap (°)'), border=1, fill=True, align='C')
+                pdf.cell(col_widths[2], 7, _s('Coverage (%)'), border=1, fill=True, align='C')
+                pdf.cell(col_widths[3], 7, _s('Gap Range (°)'), border=1, fill=True, align='C')
+                # Before/After message headers span 3 columns each
+                pdf.cell(col_widths[4] + col_widths[5] + col_widths[6], 3.5, _s('Before Msg'), border=1, fill=True, align='C')
+                pdf.cell(col_widths[7] + col_widths[8] + col_widths[9], 3.5, _s('After Msg'), border=1, fill=True, align='C')
+                pdf.ln(3.5)
+
+                # Sub headers mit gleichen Einstellungen
+                pdf.set_font('Helvetica', 'B', 8)
+                pdf.set_fill_color(*C_HEADER)
+                pdf.set_text_color(255, 255, 255)
+
+                if left_offset > 0:
+                    pdf.set_x(pdf.l_margin + left_offset)
+
+                pdf.cell(col_widths[0], 4, '', border=0, fill=False)
+                pdf.cell(col_widths[1], 4, '', border=0, fill=False)
+                pdf.cell(col_widths[2], 4, '', border=0, fill=False)
+                pdf.cell(col_widths[3], 4, '', border=0, fill=False)
+                # Before sub-columns: VRH | Time | End Azimuth
+                for i, subheader in enumerate(['VRH', 'Time', 'End Az (°)']):
+                    width = col_widths[4 + i]
+                    pdf.cell(width, 4, _s(subheader), border=1, fill=True, align='C')
+                # After sub-columns: VRH | Time | Start Azimuth
+                for i, subheader in enumerate(['VRH', 'Time', 'Start Az (°)']):
+                    width = col_widths[7 + i]
+                    pdf.cell(width, 4, _s(subheader), border=1, fill=True, align='C')
+                pdf.ln()
+
+            # Draw initial header
+            draw_table_header()
+
+            # Berechne Offset für Tabellen-Zentrierung
+            table_width = sum(col_widths)
+            page_width = pdf.w - pdf.l_margin - pdf.r_margin
+            left_offset = (page_width - table_width) / 2
+
+            # Draw data rows with page break handling
+            pdf.set_font('Helvetica', '', 8)
+            pdf.set_text_color(*C_TEXT)
+
+            rows_per_page_first = 25   # Erste Seite: 25 Zeilen
+            rows_per_page_rest = 33    # Folgende Seiten: 33 Zeilen (optimal für Landscape)
+            first_page = True
+            rows_on_current_page = 0   # Zähler für Zeilen auf aktueller Seite
+
+            for gap_idx, gap in enumerate(gap_data_sorted):
+                # Bestimme wie viele Zeilen auf diese Seite passen
+                current_rows_per_page = rows_per_page_first if first_page else rows_per_page_rest
+
+                # Check if we need a new page (zähle Zeilen seit letztem Umbruch)
+                if rows_on_current_page > 0 and rows_on_current_page >= current_rows_per_page:
+                    pdf.add_page(orientation='L')
+                    pdf.set_margins(14, 14, 14)
+                    draw_table_header()
+                    # Stelle sicher, dass Schriftfarbe nach Header auf Schwarz zurückgesetzt wird
+                    pdf.set_font('Helvetica', '', 8)
+                    pdf.set_text_color(*C_TEXT)
+                    if first_page:
+                        first_page = False
+                    rows_on_current_page = 0  # Reset für neue Seite
+
+                # Merke aktuelle Seitenzahl
+                page_before = pdf.page
+
+                # Setze X-Position für Zentrierung
+                if left_offset > 0:
+                    pdf.set_x(pdf.l_margin + left_offset)
+
+                # Alternate row colors
+                if gap_idx % 2 == 0:
+                    pdf.set_fill_color(*C_ROW_EVEN)
+                else:
+                    pdf.set_fill_color(*C_ROW_ODD)
+
+                # Draw row data
+                pdf.cell(col_widths[0], 5, _s(str(gap['rev'])), border=1, fill=True, align='C')
+                pdf.cell(col_widths[1], 5, _s(f"{gap['max_gap']:.4f}"), border=1, fill=True, align='C')
+                pdf.cell(col_widths[2], 5, _s(f"{gap['coverage']:.2f}"), border=1, fill=True, align='C')
+                pdf.cell(col_widths[3], 5, _s(f"{gap['gap_start']:.2f}-{gap['gap_end']:.2f}"), border=1, fill=True, align='C')
+                # Before message: VRH | Time | End Azimuth
+                pdf.cell(col_widths[4], 5, _s(str(gap['before_vrh'])), border=1, fill=True, align='C')
+                before_time = _format_timestamp(gap['before_ts'])
+                pdf.cell(col_widths[5], 5, _s(before_time), border=1, fill=True, align='C')
+                pdf.cell(col_widths[6], 5, _s(f"{gap['before_end']:.2f}"), border=1, fill=True, align='C')
+                # After message: VRH | Time | Start Azimuth
+                pdf.cell(col_widths[7], 5, _s(str(gap['after_vrh'])), border=1, fill=True, align='C')
+                after_time = _format_timestamp(gap['after_ts'])
+                pdf.cell(col_widths[8], 5, _s(after_time), border=1, fill=True, align='C')
+                pdf.cell(col_widths[9], 5, _s(f"{gap['after_start']:.2f}"), border=1, fill=True, align='C')
+                pdf.ln()
+
+                # Inkrementiere Zähler für Zeilen auf aktueller Seite
+                rows_on_current_page += 1
+
+                # Überprüfe ob automatischer Seitenwechsel stattgefunden hat
+                if pdf.page > page_before:
+                    # Neue Seite wurde hinzugefügt - zeichne Header
+                    draw_table_header()
+        else:
+            # No gaps found
+            pdf.set_font('Helvetica', '', 10)
+            pdf.set_text_color(*C_TEXT)
+            pdf.cell(0, 6, _s('✓ No gaps detected in this stream'),
+                    new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
     pdf.output(pdf_path)
 
 
@@ -1879,6 +2358,10 @@ def main():
     parser.add_argument(
         "--output-dir", "-d", metavar="DIR",
         help="Directory for auto-generated output files (created if missing; default: current directory)"
+    )
+    parser.add_argument(
+        "--gaps", action="store_true",
+        help="Include detailed per-revolution azimuth gap analysis in terminal output and reports"
     )
     args = parser.parse_args()
 
@@ -1917,19 +2400,21 @@ def main():
                 exit_code = 1
                 continue
             if RICH:
-                print_report(filepath, streams, total_udp, non_cat240)
+                print_report(filepath, streams, total_udp, non_cat240, show_gaps=args.gaps)
             else:
                 print_report_plain(filepath, streams, total_udp, non_cat240)
 
             if md_path is not None:
-                write_markdown(filepath, streams, total_udp, non_cat240, md_path=md_path)
+                write_markdown(filepath, streams, total_udp, non_cat240, md_path=md_path,
+                               show_gaps=args.gaps)
                 if RICH:
                     console.print(f"[dim]Markdown saved: [cyan]{md_path}[/][/]")
                 else:
                     print(f"Markdown saved: {md_path}")
 
             if pdf_path is not None:
-                write_pdf(filepath, streams, total_udp, non_cat240, pdf_path)
+                write_pdf(filepath, streams, total_udp, non_cat240, pdf_path,
+                          show_gaps=args.gaps)
                 if RICH:
                     console.print(f"[dim]PDF saved:      [cyan]{pdf_path}[/][/]")
                 else:

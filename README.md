@@ -11,7 +11,7 @@ A Python tool that parses PCAP/PCAPNG network captures, decodes ASTERIX CAT240 r
 ## Requirements
 
 - Python 3.13+ (managed via [pyenv](https://github.com/pyenv/pyenv) on macOS/Linux)
-- Dependencies: `numpy`, `matplotlib`, `rich`
+- Dependencies: `numpy`, `matplotlib`, `rich`, `fpdf2` (PDF export)
 
 ---
 
@@ -74,7 +74,7 @@ python cat240_analyzer.py --live --port 4379 --multicast 239.0.0.1
 python cat240_analyzer.py --live --port 4379 --multicast 239.0.0.1 --host 192.168.1.10
 
 # From JSON configuration:
-python cat240_analyzer.py --config config_live_example.json
+python cat240_analyzer.py --config config_live.json
 ```
 
 #### Configuration from JSON
@@ -101,7 +101,7 @@ python cat240_analyzer.py --config my_config.json --speed 20
   "log_compress": true,
   "interpolate": false,
   "sweepline": false,
-  "waterfall": true
+  "waterfall": false
 }
 ```
 
@@ -111,7 +111,7 @@ python cat240_analyzer.py --config my_config.json --speed 20
 - **Live:** `port` (number), `host` (IP address), `multicast` (IP or null)
 - **Display:** `log_compress`, `interpolate`, `sweepline`, `waterfall` (all boolean)
 
-See `config_example.json` (replay) and `config_live_example.json` (live) for complete examples.
+See `template.json` (replay) and `config_live.json` (live) for complete examples.
 
 #### Live options
 
@@ -137,7 +137,7 @@ See `config_example.json` (replay) and `config_live_example.json` (live) for com
 | `--log-compress` | Add soft-log overlay to A-Scope (second Y-axis, 0–255) |
 | `--interpolate` | Interpolate missing azimuths in gaps (for imperfect network data) |
 | `--sweepline` | Show rotating yellow line indicating current azimuth |
-| `--waterfall` | Show waterfall display (range vs. azimuth, black background) — useful for spotting gaps |
+| `--waterfall` | Show waterfall display (range vs. azimuth) — useful for spotting azimuth gaps |
 
 #### PPI display
 
@@ -157,34 +157,28 @@ See `config_example.json` (replay) and `config_live_example.json` (live) for com
 
 #### PPI / A-Scope interaction
 
+**PPI:**
+
 | Action | Effect |
 |---|---|
-| Left-click in PPI | A-Scope shows amplitude profile at that azimuth |
-| Right-click in PPI | Toggle A-Scope mode: amplitude vs. range ↔ amplitude vs. angle |
-| Scroll wheel in PPI | Zoom in / out centred on cursor |
-| Double-click in PPI | Reset zoom to full range |
-| Mouse over A-Scope | Measurement cursor with cell number and amplitude |
+| Left-click | A-Scope shows amplitude profile at that azimuth |
+| Right-click | Toggle A-Scope mode: amplitude vs. range ↔ amplitude vs. angle |
+| Scroll wheel | Zoom in / out centred on cursor |
+| Double-click | Reset zoom to full range |
 
-#### Waterfall display
+**A-Scope:**
 
-When `--waterfall` is enabled, a second window shows a **range-vs-azimuth** display:
-- **X-axis:** Azimuths (0° to 360°)  
-- **Y-axis:** Range cells (0 to maximum)  
-- **Background:** Black  
-- **Echoes:** Colored using the same colormap as the PPI (plasma by default)
-
-**Purpose:** Spot missing azimuths (gaps appear as black vertical lines) and verify continuous coverage across the full revolution.
-
-**Waterfall buttons and controls:**
-
-| Button | Effect |
+| Action | Effect |
 |---|---|
-| `Pause` / `Play` | Pause or resume playback (synchronized with PPI) |
-| `Zoom` | Activate rectangle zoom — drag to select area. When active, mouse drag creates a zoom rectangle |
-
-**Interactions:**
-- **Scroll wheel** — Zoom in/out centred on cursor position (works when Zoom mode inactive)
-- **Double-click** — Reset zoom to full 0–360° azimuth range
+| Mouse move | Cursor readout: cell / azimuth and amplitude |
+| Left-click | FWHM measurement of nearest peak |
+| Left double-click | Reset zoom |
+| Scroll wheel | Zoom X-axis centred on cursor |
+| Right-drag | Pan X-axis |
+| Right-click (azimuth mode) | Start / end manual span selection |
+| `-` / `+` buttons | Zoom out / in |
+| `<` / `>` buttons | Pan left / right |
+| `Lin` / `Log` buttons | Toggle linear / log overlay (only with `--log-compress`) |
 
 #### Azimuth coverage & interpolation
 
@@ -196,6 +190,26 @@ The PPI grid has 4096 azimuth bins covering 360°. Each incoming CAT240 message 
 - **<95%** — Significant data loss in the network stream
 
 Use `--interpolate` to automatically fill gaps with data from the previous revolution. This smooths the image for imperfect network data.
+
+#### Waterfall display
+
+When `--waterfall` is enabled, a second window shows a **range-vs-azimuth** display:
+- **X-axis:** Azimuths (0° to 360°)
+- **Y-axis:** Range cells (0 to maximum)
+- **Echoes:** Colored using the same colormap as the PPI
+
+**Purpose:** Spot missing azimuths (gaps appear as black vertical lines) and verify continuous coverage across the full revolution.
+
+**Buttons:**
+
+| Button | Effect |
+|---|---|
+| `Pause` / `Play` | Pause or resume playback (synchronized with PPI) |
+| `Zoom` | Activate rectangle zoom — drag to select area, click again to cancel |
+
+**Interactions:**
+- **Scroll wheel** — Zoom in/out centered on cursor (both axes)
+- **Double-click** — Reset zoom to full view
 
 ---
 
@@ -227,6 +241,12 @@ python cat240_stream_info.py Data/recording.pcapng --pdf report.pdf
 
 # Both Markdown and PDF in a subdirectory (created if missing):
 python cat240_stream_info.py Data/recording.pcapng --md --pdf --output-dir reports/
+
+# Include detailed per-revolution azimuth gap analysis:
+python cat240_stream_info.py Data/recording.pcapng --gaps
+
+# Gap analysis combined with PDF export:
+python cat240_stream_info.py Data/recording.pcapng --gaps --pdf
 ```
 
 The report includes per-stream:
@@ -237,6 +257,8 @@ The report includes per-stream:
 - SAC / SIC (data source identifier)
 - FSPEC breakdown with active UAP items
 - Amplitude statistics and distribution histogram
+
+With `--gaps`: detailed per-revolution azimuth gap table (landscape PDF pages), showing the largest gap per revolution, coverage percentage, gap azimuth range, and the messages immediately before and after the gap (VRH, timestamp, azimuth).
 
 ### `cat240_split_by_range.py` — Split PCAPNG by Range Scale
 
@@ -277,6 +299,7 @@ Direct link to the CAT240 specification document:
 cat240_analyzer.py       Main tool: PPI + A-Scope visualiser
 cat240_stream_info.py    Stream statistics and report generator
 cat240_split_by_range.py Split PCAPNG by pulse length (range scale)
+template.json            Template for replay JSON configuration
 enviroment.sh            macOS/Linux virtual environment setup (Bash)
 requirements.txt         Python dependencies
 .python-version          Python version pin for pyenv (3.13.0)
