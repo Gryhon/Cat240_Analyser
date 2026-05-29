@@ -31,6 +31,7 @@ import struct
 import sys
 import threading
 import time
+import warnings
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -612,8 +613,10 @@ class RadarPPI:
             self._range_ring_patches = []
             self._rings_drawn_for_cell_size = -1.0
             ax.set_facecolor('black')
-            self._mesh = ax.pcolormesh(self._X, self._Y, self._grid_render, cmap=colormap,
-                                       norm=norm, shading='nearest', rasterized=True)
+            with warnings.catch_warnings():
+                warnings.filterwarnings('ignore', 'The input coordinates to pcolormesh')
+                self._mesh = ax.pcolormesh(self._X, self._Y, self._grid_render, cmap=colormap,
+                                           norm=norm, shading='nearest', rasterized=True)
             self._mesh_ax = ax
 
             # Azimuth lines (every 30°)

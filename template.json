@@ -1,0 +1,11 @@
+{
+  "replay":       "Data/recording.pcapng",
+  "speed":        1.0,
+  "loop":         false,
+  "stream":       null,
+  "no_filter":    false,
+  "log_compress": false,
+  "interpolate":  false,
+  "sweepline":    false,
+  "waterfall":    false
+}
